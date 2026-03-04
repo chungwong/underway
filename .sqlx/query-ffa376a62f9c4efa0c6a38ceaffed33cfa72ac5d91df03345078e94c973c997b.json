@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select input from underway.task where id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "input",
+        "type_info": "Jsonb"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "ffa376a62f9c4efa0c6a38ceaffed33cfa72ac5d91df03345078e94c973c997b"
+}

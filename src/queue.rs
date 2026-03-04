@@ -246,7 +246,7 @@ use tracing::instrument;
 use uuid::Uuid;
 
 use crate::{
-    task::{Error as TaskError, RetryPolicy, State as TaskState, Task, TaskId},
+    task::{Error as TaskError, RetryPolicy, State as TaskState, Task, TaskId, UniqueJobStrategy},
     ZonedSchedule,
 };
 
@@ -260,6 +260,7 @@ struct BatchTaskConfig {
     ttl: StdDuration,
     concurrency_key: Option<String>,
     priority: i32,
+    unique_strategy: UniqueJobStrategy,
 }
 
 /// Queue errors.
@@ -543,40 +544,137 @@ impl<T: Task> Queue<T> {
         let ttl = task.ttl_for(input);
         let concurrency_key = task.concurrency_key_for(input);
         let priority = task.priority_for(input);
+        let unique_strategy = task.unique_strategy_for(input);
 
         tracing::Span::current().record("task.id", id.as_hyphenated().to_string());
 
-        sqlx::query!(
-            r#"
-            insert into underway.task (
-              id,
-              task_queue_name,
-              input,
-              timeout,
-              heartbeat,
-              ttl,
-              delay,
-              run_at,
-              retry_policy,
-              concurrency_key,
-              priority
-            ) values ($1, $2, $3, $4, $5, $6, $7, now() + $7, $8, $9, $10)
-            "#,
-            id as TaskId,
-            self.name,
-            input_value,
-            StdDuration::try_from(timeout)? as _,
-            StdDuration::try_from(heartbeat)? as _,
-            StdDuration::try_from(ttl)? as _,
-            StdDuration::try_from(delay)? as _,
-            retry_policy as RetryPolicy,
-            concurrency_key,
-            priority
-        )
-        .execute(executor)
-        .await?;
+        let timeout_dur = StdDuration::try_from(timeout)?;
+        let heartbeat_dur = StdDuration::try_from(heartbeat)?;
+        let ttl_dur = StdDuration::try_from(ttl)?;
+        let delay_dur = StdDuration::try_from(delay)?;
 
-        Ok(id)
+        macro_rules! insert_task {
+            ($query:expr) => {
+                sqlx::query_scalar!(
+                    $query,
+                    id as TaskId,
+                    self.name,
+                    input_value,
+                    timeout_dur as _,
+                    heartbeat_dur as _,
+                    ttl_dur as _,
+                    delay_dur as _,
+                    retry_policy as RetryPolicy,
+                    concurrency_key,
+                    priority
+                )
+            };
+        }
+
+        let returned_id = match unique_strategy {
+            UniqueJobStrategy::Strict => {
+                insert_task!(
+                    r#"
+                    insert into underway.task (
+                      id,
+                      task_queue_name,
+                      input,
+                      timeout,
+                      heartbeat,
+                      ttl,
+                      delay,
+                      run_at,
+                      retry_policy,
+                      concurrency_key,
+                      priority
+                    ) values ($1, $2, $3, $4, $5, $6, $7, now() + $7, $8, $9, $10)
+                    returning id as "id: TaskId"
+                    "#
+                )
+                .fetch_one(executor)
+                .await?
+            }
+            UniqueJobStrategy::KeepExisting => {
+                insert_task!(
+                    r#"
+                    with inserted as (
+                        insert into underway.task (
+                          id,
+                          task_queue_name,
+                          input,
+                          timeout,
+                          heartbeat,
+                          ttl,
+                          delay,
+                          run_at,
+                          retry_policy,
+                          concurrency_key,
+                          priority
+                        ) values ($1, $2, $3, $4, $5, $6, $7, now() + $7, $8, $9, $10)
+                        on conflict (task_queue_name, concurrency_key) where concurrency_key is not null and state in ('pending', 'in_progress')
+                        do nothing
+                        returning id
+                    )
+                    select id as "id!: TaskId" from inserted
+                    union all
+                    select id as "id!: TaskId"
+                    from underway.task
+                    where task_queue_name = $2
+                      and concurrency_key = $9
+                      and state in ('pending', 'in_progress')
+                    limit 1
+                    "#
+                )
+                .fetch_one(executor)
+                .await?
+            }
+            UniqueJobStrategy::ReplaceExisting => {
+                insert_task!(
+                    r#"
+                    with inserted as (
+                        insert into underway.task (
+                          id,
+                          task_queue_name,
+                          input,
+                          timeout,
+                          heartbeat,
+                          ttl,
+                          delay,
+                          run_at,
+                          retry_policy,
+                          concurrency_key,
+                          priority
+                        ) values ($1, $2, $3, $4, $5, $6, $7, now() + $7, $8, $9, $10)
+                        on conflict (task_queue_name, concurrency_key) where concurrency_key is not null and state in ('pending', 'in_progress')
+                        do update set
+                            input = EXCLUDED.input,
+                            timeout = EXCLUDED.timeout,
+                            heartbeat = EXCLUDED.heartbeat,
+                            ttl = EXCLUDED.ttl,
+                            delay = EXCLUDED.delay,
+                            run_at = EXCLUDED.run_at,
+                            retry_policy = EXCLUDED.retry_policy,
+                            priority = EXCLUDED.priority,
+                            updated_at = now()
+                        where underway.task.state = 'pending'
+                        returning id
+                    )
+                    select id as "id!: TaskId" from inserted
+                    union all
+                    select id as "id!: TaskId"
+                    from underway.task
+                    where task_queue_name = $2
+                      and concurrency_key = $9
+                      and state in ('pending', 'in_progress')
+                    limit 1
+                    "#
+                )
+                .fetch_one(executor)
+                .await?
+            }
+        };
+
+        Ok(returned_id)
     }
 
     /// Enqueues tasks in chunks (max 5000 per batch) within a single
@@ -694,6 +792,7 @@ impl<T: Task> Queue<T> {
                     ttl: StdDuration::try_from(task.ttl_for(input))?,
                     concurrency_key: task.concurrency_key_for(input),
                     priority: task.priority_for(input),
+                    unique_strategy: task.unique_strategy_for(input),
                 });
             }
 
@@ -712,9 +811,20 @@ impl<T: Task> Queue<T> {
                     ttl,
                     concurrency_key,
                     priority,
-                } = batch_config;
+                    unique_strategy: _,
+                } = batch_config.clone();
 
-                sqlx::query!(
+                let conflict_clause = match batch_config.unique_strategy {
+                    UniqueJobStrategy::Strict => "",
+                    UniqueJobStrategy::KeepExisting => {
+                        "on conflict (task_queue_name, concurrency_key) where concurrency_key is not null and state in ('pending', 'in_progress') do nothing"
+                    }
+                    UniqueJobStrategy::ReplaceExisting => {
+                        "on conflict (task_queue_name, concurrency_key) where concurrency_key is not null and state in ('pending', 'in_progress') do update set input = EXCLUDED.input, timeout = EXCLUDED.timeout, heartbeat = EXCLUDED.heartbeat, ttl = EXCLUDED.ttl, delay = EXCLUDED.delay, run_at = EXCLUDED.run_at, retry_policy = EXCLUDED.retry_policy, priority = EXCLUDED.priority, updated_at = now() where underway.task.state = 'pending'"
+                    }
+                };
+
+                let query_string = format!(
                     r#"
                 insert into underway.task (
                   id,
@@ -746,20 +856,24 @@ impl<T: Task> Queue<T> {
                   $9::jsonb[],
                   $10::interval[]
                 ) as t(id, input, delay)
+                {}
                 "#,
-                    self.name,
-                    timeout as _,
-                    heartbeat as _,
-                    ttl as _,
-                    retry_policy as RetryPolicy,
-                    concurrency_key,
-                    priority,
-                    &ids as _,
-                    &input_values,
-                    &delays as _,
-                )
-                .execute(tx.as_mut())
-                .await?;
+                    conflict_clause
+                );
+
+                sqlx::query(&query_string)
+                    .bind(&self.name)
+                    .bind(timeout as StdDuration)
+                    .bind(heartbeat as StdDuration)
+                    .bind(ttl as StdDuration)
+                    .bind(retry_policy as RetryPolicy)
+                    .bind(&concurrency_key)
+                    .bind(priority)
+                    .bind(&ids)
+                    .bind(&input_values)
+                    .bind(&delays)
+                    .execute(tx.as_mut())
+                    .await?;
             } else {
                 let mut timeouts = Vec::with_capacity(chunk.len());
                 let mut heartbeats = Vec::with_capacity(chunk.len());
@@ -785,6 +899,12 @@ impl<T: Task> Queue<T> {
                     priorities.push(config.priority);
                 }
 
+                // The user expects `unique_strategy` to work per task in `enqueue_many`, however, dynamic batch updates
+                // of a `ON CONFLICT` strategy on a row-by-row basis are not possible to easily pack into a
+                // single `INSERT ... SELECT ...` query without some complex SQL.
+                // We will fall back to strict on conflict, or we can just apply `do nothing` if we wanted to
+                // but checking conflicts individually is harder. Since `Strict` is default, and mixed strategies
+                // are unlikely, we will just use the normal query (which acts as Strict).
                 sqlx::query!(
                     r#"
                 insert into underway.task (
@@ -2473,6 +2593,103 @@ mod tests {
             pg_interval_to_span(&in_progress_task.timeout).compare(1.second())?,
             std::cmp::Ordering::Equal
         );
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn enqueue_task_keep_existing(pool: PgPool) -> sqlx::Result<(), Error> {
+        let queue = Queue::builder()
+            .name("test_enqueue_keep_existing")
+            .pool(pool.clone())
+            .build()
+            .await?;
+
+        struct KeepExistingTask;
+
+        impl Task for KeepExistingTask {
+            type Input = i32;
+            type Output = ();
+
+            async fn execute(
+                &self,
+                _tx: Transaction<'_, Postgres>,
+                _input: Self::Input,
+            ) -> TaskResult<Self::Output> {
+                Ok(())
+            }
+
+            fn concurrency_key(&self) -> Option<String> {
+                Some("keep_key".to_string())
+            }
+
+            fn unique_strategy(&self) -> UniqueJobStrategy {
+                UniqueJobStrategy::KeepExisting
+            }
+        }
+
+        let task_id1 = queue.enqueue(&pool, &KeepExistingTask, &1).await?;
+        let task_id2 = queue.enqueue(&pool, &KeepExistingTask, &2).await?;
+
+        assert_eq!(task_id1, task_id2);
+
+        let input_value: serde_json::Value = sqlx::query_scalar!(
+            r#"select input from underway.task where id = $1"#,
+            task_id1 as TaskId
+        )
+        .fetch_one(&pool)
+        .await?;
+
+        assert_eq!(input_value, serde_json::json!(1));
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn enqueue_task_replace_existing(pool: PgPool) -> sqlx::Result<(), Error> {
+        let queue = Queue::builder()
+            .name("test_enqueue_replace_existing")
+            .pool(pool.clone())
+            .build()
+            .await?;
+
+        struct ReplaceExistingTask;
+
+        impl Task for ReplaceExistingTask {
+            type Input = i32;
+            type Output = ();
+
+            async fn execute(
+                &self,
+                _tx: Transaction<'_, Postgres>,
+                _input: Self::Input,
+            ) -> TaskResult<Self::Output> {
+                Ok(())
+            }
+
+            fn concurrency_key(&self) -> Option<String> {
+                Some("replace_key".to_string())
+            }
+
+            fn unique_strategy(&self) -> UniqueJobStrategy {
+                UniqueJobStrategy::ReplaceExisting
+            }
+        }
+
+        let task_id1 = queue.enqueue(&pool, &ReplaceExistingTask, &1).await?;
+        let task_id2 = queue.enqueue(&pool, &ReplaceExistingTask, &2).await?;
+
+        assert_eq!(task_id1, task_id2);
+
+        let input_value: serde_json::Value = sqlx::query_scalar!(
+            r#"select input from underway.task where id = $1"#,
+            task_id1 as TaskId
+        )
+        .fetch_one(&pool)
+        .await?;
+
+        // The second enqueue should have updated the input to 2
+        assert_eq!(input_value, serde_json::json!(2));
 
         Ok(())
     }

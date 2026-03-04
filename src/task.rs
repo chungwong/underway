@@ -159,6 +159,24 @@ pub enum Error {
     Retryable(String),
 }
 
+/// Defines the strategy to use when a task with a concurrency key conflicts
+/// with another task that is currently pending or in progress.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum UniqueJobStrategy {
+    /// Return a constraint violation error if a conflict occurs.
+    #[default]
+    Strict,
+
+    /// Keep the existing task and skip enqueueing the new one. The existing
+    /// task ID is returned.
+    KeepExisting,
+
+    /// Update the existing pending task with the new input and schedule. If the
+    /// task is already in progress, it behaves like `KeepExisting`. The existing
+    /// task ID is returned.
+    ReplaceExisting,
+}
+
 /// Convenience trait for converting results into task results.
 ///
 /// This makes it easier to convert execution errors to either
@@ -528,6 +546,16 @@ pub trait Task: Send + 'static {
         None
     }
 
+    /// Specifies the unique job strategy when a concurrency key is provided.
+    ///
+    /// Only applies when a concurrency key is specified and there's a conflict
+    /// with an existing task in a `pending` or `in_progress` state.
+    ///
+    /// Defaults to `UniqueJobStrategy::Strict`.
+    fn unique_strategy(&self) -> UniqueJobStrategy {
+        UniqueJobStrategy::default()
+    }
+
     /// Specifies the priority of the task.
     ///
     /// Higher-priority tasks will be processed before lower-priority ones. This
@@ -607,6 +635,13 @@ pub trait Task: Send + 'static {
     /// Defaults to [`concurrency_key`](Task::concurrency_key).
     fn concurrency_key_for(&self, _input: &Self::Input) -> Option<String> {
         self.concurrency_key()
+    }
+
+    /// Specifies the unique job strategy for a specific input.
+    ///
+    /// Defaults to [`unique_strategy`](Task::unique_strategy).
+    fn unique_strategy_for(&self, _input: &Self::Input) -> UniqueJobStrategy {
+        self.unique_strategy()
     }
 
     /// Provides the priority for a specific input.

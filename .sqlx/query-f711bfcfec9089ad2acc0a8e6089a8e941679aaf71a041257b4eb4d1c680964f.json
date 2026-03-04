@@ -1,8 +1,14 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            insert into underway.task (\n              id,\n              task_queue_name,\n              input,\n              timeout,\n              heartbeat,\n              ttl,\n              delay,\n              run_at,\n              retry_policy,\n              concurrency_key,\n              priority\n            ) values ($1, $2, $3, $4, $5, $6, $7, now() + $7, $8, $9, $10)\n            ",
+  "query": "\n                    insert into underway.task (\n                      id,\n                      task_queue_name,\n                      input,\n                      timeout,\n                      heartbeat,\n                      ttl,\n                      delay,\n                      run_at,\n                      retry_policy,\n                      concurrency_key,\n                      priority\n                    ) values ($1, $2, $3, $4, $5, $6, $7, now() + $7, $8, $9, $10)\n                    returning id as \"id: TaskId\"\n                    ",
   "describe": {
-    "columns": [],
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: TaskId",
+        "type_info": "Uuid"
+      }
+    ],
     "parameters": {
       "Left": [
         "Uuid",
@@ -45,7 +51,9 @@
         "Int4"
       ]
     },
-    "nullable": []
+    "nullable": [
+      false
+    ]
   },
-  "hash": "db3d217d949d2f9cf64d13b08d291cd8566d0bfb3d621ecaf5b85eed52a9cc1f"
+  "hash": "f711bfcfec9089ad2acc0a8e6089a8e941679aaf71a041257b4eb4d1c680964f"
 }
