@@ -2032,10 +2032,12 @@ mod tests {
         #[derive(Clone)]
         struct State {
             data: Arc<Mutex<String>>,
+            notify: Arc<tokio::sync::Notify>,
         }
 
         let state = State {
             data: Arc::new(Mutex::new("foo".to_string())),
+            notify: Arc::new(tokio::sync::Notify::new()),
         };
 
         let workflow = Workflow::builder()
@@ -2043,6 +2045,7 @@ mod tests {
             .step(|cx, _| async move {
                 let mut data = cx.state.data.lock().expect("Mutex should not be poisoned");
                 *data = "bar".to_string();
+                cx.state.notify.notify_one();
                 Transition::complete()
             })
             .name("one_step_with_mutable_state")
@@ -2054,8 +2057,11 @@ mod tests {
 
         let runtime_handle = workflow.runtime().start();
 
-        // Give the workflow a moment to process.
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        // Await the precise moment the workflow step updates the state and sends a notification!
+        // No arbitrary sleeping or aggressive polling needed.
+        tokio::time::timeout(tokio::time::Duration::from_secs(5), state.notify.notified())
+            .await
+            .expect("Workflow step failed to notify within timeout");
 
         assert_eq!(
             *state.data.lock().expect("Mutex should not be poisoned"),

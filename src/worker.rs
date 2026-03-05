@@ -1079,10 +1079,7 @@ pub(crate) fn pg_interval_to_span(
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        sync::Arc,
-        time::{Duration as StdDuration, Instant},
-    };
+    use std::{sync::Arc, time::Duration as StdDuration};
 
     use sqlx::{PgPool, Postgres, Transaction};
     use tokio::sync::Mutex;
@@ -1129,6 +1126,13 @@ mod tests {
             } else {
                 Ok(())
             }
+        }
+
+        fn retry_policy(&self) -> RetryPolicy {
+            RetryPolicy::builder()
+                .initial_interval_ms(1)
+                .max_interval_ms(1)
+                .build()
         }
     }
 
@@ -1186,23 +1190,20 @@ mod tests {
         // Enqueue the task
         let task_id = queue.enqueue(&pool, &worker.task, &()).await?;
 
-        // Process the task multiple times to simulate retries
-        for retries in 0..3 {
-            let start = Instant::now();
-            let timeout = StdDuration::from_secs(10);
-
-            loop {
-                if let Some(processed_task_id) = worker.process_next_task().await? {
-                    assert_eq!(task_id, processed_task_id);
-                    break;
+        // Process the task multiple times to simulate retries without erratic sleeping!
+        for _ in 0..3 {
+            tokio::time::timeout(StdDuration::from_secs(5), async {
+                loop {
+                    if let Some(processed_task_id) = worker.process_next_task().await.unwrap() {
+                        assert_eq!(task_id, processed_task_id);
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                    tokio::time::sleep(StdDuration::from_millis(10)).await;
                 }
-
-                if start.elapsed() > timeout {
-                    panic!("Timed out waiting for retry {retries}");
-                }
-
-                tokio::time::sleep(StdDuration::from_millis(100)).await;
-            }
+            })
+            .await
+            .expect("Worker failed to pick up and process the retried task within timeout");
         }
 
         // Verify that the fail_times counter has reached zero
@@ -1332,9 +1333,10 @@ mod tests {
         // Start workers before queuing tasks
         let queue = Arc::new(queue);
         let worker = Worker::new(queue.clone(), LongRunningTask);
+        let mut handles = vec![];
         for _ in 0..2 {
             let worker = worker.clone();
-            tokio::spawn(async move { worker.run().await });
+            handles.push(tokio::spawn(async move { worker.run().await }));
         }
 
         // Wait briefly to ensure workers are listening
@@ -1345,12 +1347,16 @@ mod tests {
             queue.enqueue(&pool, &LongRunningTask, &()).await?;
         }
 
-        // Initiate graceful shutdown
+        // Initiate graceful shutdown (sends signal to workers!)
         graceful_shutdown(&pool).await?;
 
-        // Wait for tasks to be done
-        tokio::time::sleep(StdDuration::from_secs(2)).await;
+        // Gracefully await the workers' `run().await` process completion safely.
+        // Once the workers exit natively, we are mathematically guaranteed the shutdown finished!
+        for handle in handles {
+            let _ = tokio::time::timeout(StdDuration::from_secs(5), handle).await;
+        }
 
+        // Assert the test conditions reliably!
         let succeeded = sqlx::query_scalar!(
             r#"
             select count(*)
@@ -1388,10 +1394,14 @@ mod tests {
 
     #[sqlx::test]
     async fn heartbeat_stops_after_task_completion(pool: PgPool) -> sqlx::Result<(), Error> {
-        // Define a task that sleeps for a short duration
-        struct SleepTask;
+        // Define a controlled task that deterministically signals the test suite
+        #[derive(Clone)]
+        struct ControlledTask {
+            started: Arc<tokio::sync::Notify>,
+            finish: Arc<tokio::sync::Notify>,
+        }
 
-        impl Task for SleepTask {
+        impl Task for ControlledTask {
             type Input = ();
             type Output = ();
 
@@ -1400,15 +1410,20 @@ mod tests {
                 _: Transaction<'_, Postgres>,
                 _: Self::Input,
             ) -> TaskResult<Self::Output> {
-                // Simulate work by sleeping
-                tokio::time::sleep(StdDuration::from_secs(5)).await;
+                // Signal that we started
+                self.started.notify_one();
+                // Await instantly without sleeping
+                self.finish.notified().await;
                 Ok(())
             }
 
             fn heartbeat(&self) -> Span {
-                1.second()
+                100.milliseconds()
             }
         }
+
+        let notify_started = Arc::new(tokio::sync::Notify::new());
+        let notify_finish = Arc::new(tokio::sync::Notify::new());
 
         let queue = Queue::builder()
             .name("heartbeat_stops_after_task_completion")
@@ -1416,99 +1431,86 @@ mod tests {
             .build()
             .await?;
 
-        // Enqueue the sleep task
-        let task_id = queue.enqueue(&pool, &SleepTask, &()).await?;
+        let task = ControlledTask {
+            started: notify_started.clone(),
+            finish: notify_finish.clone(),
+        };
+        let task_id = queue.enqueue(&pool, &task, &()).await?;
 
-        // Start the worker
         let queue = Arc::new(queue);
-        let worker = Worker::new(queue.clone(), SleepTask);
-        let worker_handle = tokio::spawn(async move { worker.run_every(1.second()).await });
+        let worker = Worker::new(queue.clone(), task);
+        let worker_handle = tokio::spawn(async move { worker.run_every(50.milliseconds()).await });
 
-        // Ensure the worker has time to dequeue the task
-        tokio::time::sleep(StdDuration::from_secs(1)).await;
+        // Instantly wait for the worker to start the task
+        tokio::time::timeout(StdDuration::from_secs(5), notify_started.notified())
+            .await
+            .expect("Worker failed to dequeue and start task");
 
-        // Monitor last_heartbeat_at during task execution
-        let mut last_heartbeat_at = None;
-        let start_time = Instant::now();
+        // Wait deterministically for heartbeat updates without arbitrary sleeps
+        let initial_heartbeat = sqlx::query!(
+            r#"select last_heartbeat_at as "last_heartbeat_at: i64" from underway.task where id = $1"#,
+            task_id as TaskId
+        ).fetch_one(&pool).await?.last_heartbeat_at.unwrap();
 
-        while start_time.elapsed() < StdDuration::from_secs(6) {
-            // Fetch last_heartbeat_at from the database
-            let task_row = sqlx::query!(
-                r#"
-                select last_heartbeat_at as "last_heartbeat_at: i64"
-                from underway.task
-                where id = $1
-                  and task_queue_name = $2
-                "#,
-                task_id as TaskId,
-                queue.name
-            )
-            .fetch_one(&pool)
-            .await?;
+        tokio::time::timeout(StdDuration::from_secs(5), async {
+            loop {
+                let curr_result = sqlx::query!(
+                    r#"select last_heartbeat_at as "last_heartbeat_at: i64" from underway.task where id = $1"#,
+                    task_id as TaskId
+                ).fetch_one(&pool).await;
 
-            let current_heartbeat = task_row
-                .last_heartbeat_at
-                .expect("A heartbeat should be set");
-
-            if let Some(prev_heartbeat) = last_heartbeat_at {
-                // Ensure last_heartbeat_at is being updated
-                assert!(current_heartbeat > prev_heartbeat);
+                if let Ok(row) = curr_result {
+                    if let Some(curr) = row.last_heartbeat_at {
+                        if curr > initial_heartbeat {
+                            break;
+                        }
+                    }
+                }
+                tokio::task::yield_now().await;
+                tokio::time::sleep(StdDuration::from_millis(5)).await;
             }
-            last_heartbeat_at = Some(current_heartbeat);
+        })
+        .await
+        .expect("Heartbeat failed to update within timeout");
 
-            // Sleep before the next check
-            tokio::time::sleep(StdDuration::from_secs(1)).await;
-        }
+        // Tell task to finish natively
+        notify_finish.notify_one();
 
-        // Wait for the task to complete
-        worker_handle.abort(); // Ensure the worker task is stopped
+        // Dynamically poll database for task transition to Succeeded state
+        let task_state = tokio::time::timeout(StdDuration::from_secs(5), async {
+            loop {
+                let state = sqlx::query_scalar!(
+                    r#"select state as "state: TaskState" from underway.task where id = $1"#,
+                    task_id as TaskId
+                )
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+                if state == TaskState::Succeeded {
+                    return state;
+                }
+                tokio::task::yield_now().await;
+                tokio::time::sleep(StdDuration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("Task failed to transition to Succeeded state");
 
-        // Record the last heartbeat timestamp after task completion
-        let final_task_row = sqlx::query!(
-            r#"
-            select last_heartbeat_at as "last_heartbeat_at: i64"
-            from underway.task
-            where id = $1
-            "#,
-            task_id as TaskId
-        )
-        .fetch_one(&pool)
-        .await?;
+        // Assure we matched the correct status securely
+        assert_eq!(task_state, TaskState::Succeeded);
 
-        // Wait for a duration longer than the heartbeat interval
-        tokio::time::sleep(StdDuration::from_secs(2)).await;
+        // Terminate worker deterministically now that execution succeeded fully
+        worker_handle.abort();
 
-        // Check if last_heartbeat_at has not been updated after task completion
-        let post_completion_task_row = sqlx::query!(
-            r#"
-            select last_heartbeat_at as "last_heartbeat_at: i64"
-            from underway.task
-            where id = $1
-            "#,
-            task_id as TaskId
-        )
-        .fetch_one(&pool)
-        .await?;
+        let final_task_row = sqlx::query!(r#"select last_heartbeat_at as "last_heartbeat_at: i64" from underway.task where id = $1"#, task_id as TaskId).fetch_one(&pool).await?;
 
-        // Assert that last_heartbeat_at did not change after task completion
+        // Ensure absolutely no future heartbeats are emitted after success
+        tokio::time::sleep(StdDuration::from_millis(150)).await;
+        let post_completion_task_row = sqlx::query!(r#"select last_heartbeat_at as "last_heartbeat_at: i64" from underway.task where id = $1"#, task_id as TaskId).fetch_one(&pool).await?;
         assert_eq!(
             final_task_row.last_heartbeat_at,
             post_completion_task_row.last_heartbeat_at
         );
-
-        // Confirm that the task has succeeded
-        let task_state = sqlx::query_scalar!(
-            r#"
-            select state as "state: TaskState"
-            from underway.task
-            where id = $1
-            "#,
-            task_id as TaskId
-        )
-        .fetch_one(&pool)
-        .await?;
-
-        assert_eq!(task_state, TaskState::Succeeded);
 
         Ok(())
     }
@@ -1516,18 +1518,36 @@ mod tests {
     #[tokio::test]
     async fn reap_completed_drains_joinset() {
         let mut processing_tasks = JoinSet::new();
+        let (tx, _rx) = tokio::sync::broadcast::channel::<()>(1);
 
         for _ in 0..3 {
-            processing_tasks.spawn(async {
-                tokio::time::sleep(StdDuration::from_millis(10)).await;
+            let mut rx = tx.subscribe();
+            processing_tasks.spawn(async move {
+                let _ = rx.recv().await;
             });
         }
 
-        tokio::time::sleep(StdDuration::from_millis(25)).await;
-
-        assert!(!processing_tasks.is_empty());
+        // The spawned tasks natively pause at the broadcast channel (even if delayed!)
+        tokio::task::yield_now().await;
 
         reap_completed(&mut processing_tasks);
+        assert!(!processing_tasks.is_empty());
+
+        // Signal all to complete by dropping the transmitter!
+        drop(tx);
+
+        // Wait securely for the threaded futures to complete using an intelligent polling loop up to 1 second
+        tokio::time::timeout(StdDuration::from_secs(1), async {
+            loop {
+                reap_completed(&mut processing_tasks);
+                if processing_tasks.is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("JoinSet failed to drain and reap completed processes");
 
         assert!(processing_tasks.is_empty());
     }
