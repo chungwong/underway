@@ -177,6 +177,43 @@ pub enum UniqueJobStrategy {
     ReplaceExisting,
 }
 
+/// The result returned by a custom [`RateLimiter`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RateLimitDecision {
+    /// The task is allowed to proceed immediately.
+    Allowed,
+    /// The global rate limit has been reached according to the custom algorithm.
+    ///
+    /// The task execution will be aborted and its `run_at` timestamp will be
+    /// shifted into the future by the specified `Duration`.
+    Limited {
+        /// The precise interval this task should be put to sleep before returning to the Pending queue.
+        retry_after: std::time::Duration,
+    },
+}
+
+use std::pin::Pin;
+
+/// A "Bring Your Own" Rate Limiting system that allows developers to defensively
+/// throttle their queues using custom algorithms (e.g. GCRA, Token Bucket, Fixed Window)
+/// often backed by external systems like Redis.
+///
+/// If a task is rate limited, the worker will gracefully pause the task and shift
+/// its scheduling into the future, preventing infinite "Busy Waiting" database loops.
+pub trait RateLimiter: Send + Sync {
+    /// Evaluates if a task is allowed to execute on this queue right now.
+    fn check<'a>(
+        &'a self,
+        queue_name: &'a str,
+    ) -> Pin<Box<dyn Future<Output = crate::task::Result<RateLimitDecision>> + Send + 'a>>;
+}
+
+impl std::fmt::Debug for dyn RateLimiter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "RateLimiter")
+    }
+}
+
 /// Convenience trait for converting results into task results.
 ///
 /// This makes it easier to convert execution errors to either

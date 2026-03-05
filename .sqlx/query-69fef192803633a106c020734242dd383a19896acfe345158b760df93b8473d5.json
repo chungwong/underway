@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                update underway.task_queue\n                set max_concurrency = $2\n                where name = $1\n                ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "69fef192803633a106c020734242dd383a19896acfe345158b760df93b8473d5"
+}

@@ -1,0 +1,30 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                        WITH current_state AS (\n                            SELECT window_start AS tat FROM underway.global_rate_limit WHERE id = $1\n                        ),\n                        calculation AS (\n                            SELECT\n                                -- If this is a completely fresh bucket, start the TAT exactly 1 full emission interval into the past.\n                                -- Use LEAST to ensure the current_tat bounds the GREATEST call correctly.\n                                COALESCE((SELECT tat FROM current_state), now() - make_interval(secs => $2)) AS current_tat,\n                                now() AS arrival_time\n                        ),\n                        decision AS (\n                            SELECT\n                                current_tat,\n                                arrival_time,\n                                -- If current_tat is in the past, jump it to exactly `arrival_time`.\n                                -- But since we initialized an empty bucket directly to `now() - emission`,\n                                -- the GREATEST call would jump it to `now()` here!\n                                -- So for a fresh bucket, new_tat = now() + emission\n                                GREATEST(arrival_time - make_interval(secs => $3), current_tat) + make_interval(secs => $2) AS new_tat,\n                                arrival_time + make_interval(secs => $3) AS allowance_time\n                            FROM calculation\n                        ),\n                        upsert AS (\n                            INSERT INTO underway.global_rate_limit (id, tokens_used, window_start)\n                            SELECT $1, 0, new_tat FROM decision\n                            ON CONFLICT (id) DO UPDATE\n                            SET window_start = CASE\n                                -- Only advance the TAT tracker if the resulting token request fits within the delay tolerance burst!\n                                WHEN (SELECT new_tat FROM decision) <= (SELECT allowance_time FROM decision)\n                                THEN (SELECT new_tat FROM decision)\n                                ELSE underway.global_rate_limit.window_start\n                            END\n                            RETURNING window_start\n                        )\n                        SELECT\n                            -- Ensure we treat EXACT matches within the tolerance mathematically valid\n                            (new_tat <= allowance_time) AS \"is_allowed!\",\n                            -- Wait time is always how far the target TAT overshoots the burst tolerance allowance limit\n                            extract(epoch from (new_tat - allowance_time))::float8 AS \"wait_time_secs!\"\n                        FROM decision\n                        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "is_allowed!",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 1,
+        "name": "wait_time_secs!",
+        "type_info": "Float8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Float8",
+        "Float8"
+      ]
+    },
+    "nullable": [
+      null,
+      null
+    ]
+  },
+  "hash": "94e6dd1c30dc752b95db4c9b6979e172e2bd3346fe79ac2b20adef83a917ff28"
+}

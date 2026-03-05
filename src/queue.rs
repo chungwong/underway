@@ -234,8 +234,10 @@
 //! # }
 //! ```
 
+use std::sync::Arc;
 use std::{borrow::Cow, marker::PhantomData, sync::OnceLock, time::Duration as StdDuration};
 
+use crate::task::RateLimiter;
 use builder_states::{Initial, NameSet, PoolSet};
 use jiff::{Span, ToSpan};
 use sqlx::{
@@ -303,6 +305,8 @@ pub struct Queue<T: Task> {
     pub(crate) name: String,
     pub(crate) dlq_name: Option<String>,
     pub(crate) pool: PgPool,
+    pub(crate) max_concurrency: Option<i32>,
+    pub(crate) rate_limiter: Option<Arc<dyn RateLimiter>>,
     _marker: PhantomData<T>,
 }
 
@@ -312,6 +316,8 @@ impl<T: Task> Clone for Queue<T> {
             name: self.name.clone(),
             dlq_name: self.dlq_name.clone(),
             pool: self.pool.clone(),
+            max_concurrency: self.max_concurrency,
+            rate_limiter: self.rate_limiter.clone(),
             _marker: PhantomData,
         }
     }
@@ -1171,10 +1177,29 @@ impl<T: Task> Queue<T> {
         let in_progress_task = sqlx::query_as!(
             InProgressTask,
             r#"
-            with available_task as (
+            with queue_cfg as (
+                select max_concurrency
+                from underway.task_queue
+                where name = $1
+            ),
+            active_counts as (
+                select count(*) as cnt
+                from underway.task
+                where task_queue_name = $1
+                  and state = $3
+                  and (lease_expires_at is null or lease_expires_at > now())
+            ),
+            available_task as (
                 select id
                 from underway.task
               where task_queue_name = $1
+                and (
+                    not exists (
+                        select 1 from queue_cfg, active_counts
+                        where queue_cfg.max_concurrency is not null
+                          and active_counts.cnt >= queue_cfg.max_concurrency
+                    )
+                )
                 and (
                     (
                         state = $2
@@ -2062,19 +2087,27 @@ where
 }
 
 mod builder_states {
+    use crate::task::RateLimiter;
     use sqlx::PgPool;
+    use std::sync::Arc;
 
     pub struct Initial;
 
     pub struct NameSet {
         pub name: String,
         pub dlq_name: Option<String>,
+        pub max_concurrency: Option<i32>,
+        pub global_rate_limit_config: Option<(String, crate::rate_limit::RateLimitAlgorithm)>,
+        pub rate_limiter: Option<Arc<dyn RateLimiter>>,
     }
 
     pub struct PoolSet {
         pub name: String,
         pub pool: PgPool,
         pub dlq_name: Option<String>,
+        pub max_concurrency: Option<i32>,
+        pub global_rate_limit_config: Option<(String, crate::rate_limit::RateLimitAlgorithm)>,
+        pub rate_limiter: Option<Arc<dyn RateLimiter>>,
     }
 }
 
@@ -2150,6 +2183,9 @@ impl<T: Task> Builder<T, Initial> {
             state: NameSet {
                 name: name.into(),
                 dlq_name: None,
+                max_concurrency: None,
+                global_rate_limit_config: None,
+                rate_limiter: None,
             },
             _marker: PhantomData,
         }
@@ -2184,6 +2220,38 @@ impl<T: Task> Builder<T, NameSet> {
     /// ```
     pub fn dead_letter_queue(mut self, dlq_name: impl Into<String>) -> Self {
         self.state.dlq_name = Some(dlq_name.into());
+        self
+    }
+
+    /// Set the maximum number of concurrent tasks allowed to run for this queue.
+    ///
+    /// The database will natively enforce this limit across all workers globally.
+    pub fn max_concurrency(mut self, max: i32) -> Self {
+        self.state.max_concurrency = Some(max);
+        self
+    }
+
+    /// Provide a custom `RateLimiter` plugin for complex logic like Token Buckets.
+    ///
+    /// Rate limiters intercept the worker immediately after checkout. If limited,
+    /// the worker postpones the task execution into the future rather than retrying it immediately,
+    /// preventing infinite database "busy waiting" loops.
+    pub fn rate_limiter(mut self, limiter: std::sync::Arc<dyn crate::task::RateLimiter>) -> Self {
+        self.state.rate_limiter = Some(limiter);
+        self
+    }
+
+    /// Add a highly efficient, distributed API rate limit out-of-the-box powered natively by Postgres.
+    ///
+    /// This utilizes the `underway.global_rate_limit` table to ensure that across all your distributed
+    /// worker processes, tasks on this queue will satisfy the requested enforcement algorithm.
+    /// If the algorithm's limit is reached, tasks are gently delayed (no busy-waiting).
+    pub fn global_rate_limit(
+        mut self,
+        id: impl Into<String>,
+        algorithm: crate::rate_limit::RateLimitAlgorithm,
+    ) -> Self {
+        self.state.global_rate_limit_config = Some((id.into(), algorithm));
         self
     }
 
@@ -2226,6 +2294,9 @@ impl<T: Task> Builder<T, NameSet> {
             state: PoolSet {
                 name: self.state.name,
                 dlq_name: self.state.dlq_name,
+                max_concurrency: self.state.max_concurrency,
+                global_rate_limit_config: self.state.global_rate_limit_config,
+                rate_limiter: self.state.rate_limiter,
                 pool,
             },
             _marker: PhantomData,
@@ -2283,12 +2354,42 @@ impl<T: Task> Builder<T, PoolSet> {
             Queue::<T>::create(&mut *tx, dlq_name).await?;
         }
 
+        // Add max concurrency if specified
+        if let Some(max_concurrency) = state.max_concurrency {
+            sqlx::query!(
+                r#"
+                update underway.task_queue
+                set max_concurrency = $2
+                where name = $1
+                "#,
+                state.name,
+                max_concurrency
+            )
+            .execute(&mut *tx)
+            .await?;
+        }
+
         tx.commit().await?;
+
+        // Instantiate the native Postgres Global Rate Limiter if configured
+        let rate_limiter = if let Some((id, algorithm)) = state.global_rate_limit_config {
+            Some(
+                std::sync::Arc::new(crate::rate_limit::PostgresRateLimiter::new(
+                    state.pool.clone(),
+                    id,
+                    algorithm,
+                )) as std::sync::Arc<dyn crate::task::RateLimiter>,
+            )
+        } else {
+            state.rate_limiter
+        };
 
         Ok(Queue {
             name: state.name,
             dlq_name: state.dlq_name,
             pool: state.pool,
+            max_concurrency: state.max_concurrency,
+            rate_limiter,
             _marker: PhantomData,
         })
     }

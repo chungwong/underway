@@ -24,6 +24,9 @@
 //! - **Operate with Production Controls** Transactional `*_using` APIs,
 //!   retries, cron scheduling, heartbeats, and fencing support reliable
 //!   high-concurrency execution.
+//! - **Native Global Rate Limiting** Easily throttle external API requests
+//!   across your entire fleet using `FixedWindow`, `TokenBucket`, or `GCRA`
+//!   algorithms backed by PostgreSQL.
 //!
 //! ## Quick Start
 //!
@@ -324,6 +327,7 @@
 //!   activities.
 //! - [Activities](#activities) model durable side effects for workflow steps.
 //! - [Queues](#queues) provide an interface for managing task lifecycle.
+//! - [Rate Limiting](#rate-limiting) cleanly throttles distributed processing.
 //! - [Workers](#workers) interface with queues to execute tasks.
 //!
 //! ## Tasks
@@ -375,6 +379,13 @@
 //! tasks, and when found, try to invoke the task's execute routine.
 //!
 //! See [`worker`] for more details about workers.
+//!
+//! ## Rate Limiting
+//!
+//! Rate limiting allows you to gracefully control the throughput of your queues
+//! using powerful distributed algorithms like Token Bucket, GCRA, and Fixed Window.
+//!
+//! See [`rate_limit`] for more details about global rate limiting API throttling.
 #![warn(clippy::all, nonstandard_style, future_incompatible, missing_docs)]
 #![forbid(unsafe_code)]
 
@@ -393,6 +404,8 @@ pub use crate::{
 pub mod activity;
 mod activity_worker;
 pub mod queue;
+/// Provides native algorithms like Fixed Window and GCRA via PostgreSQL for `QueueBuilder::global_rate_limit`.
+pub mod rate_limit;
 pub mod runtime;
 mod scheduler;
 pub mod task;
@@ -488,7 +501,7 @@ mod tests {
             r#"
             select exists (
                 select 1 from information_schema.tables
-                where table_schema = 'underway' and 
+                where table_schema = 'underway' and
                       table_name = '_sqlx_migrations'
             );
             "#,

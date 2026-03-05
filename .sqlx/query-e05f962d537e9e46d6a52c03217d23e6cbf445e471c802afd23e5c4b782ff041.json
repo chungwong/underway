@@ -1,0 +1,30 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                        WITH current_state AS (\n                            SELECT tokens_used, window_start FROM underway.global_rate_limit WHERE id = $1\n                        ),\n                        calculation AS (\n                            SELECT\n                                -- For a fresh bucket, current_state is empty! `LEAST(max, NULL)` evaluates to `max` in postgres, causing\n                                -- the query to bloat the bucket instantly to max_capacity.\n                                -- Use an explicit IF/COALESCE guard on the entire calculation!\n                                COALESCE(\n                                    (SELECT GREATEST(0.0, LEAST($3::float8, tokens_used - extract(epoch from (now() - window_start))::float8 * $2)) FROM current_state),\n                                    0.0\n                                ) AS current_tokens,\n                                now() AS arrival_time\n                        ),\n                        decision AS (\n                            SELECT\n                                current_tokens,\n                                arrival_time,\n                                (current_tokens + 1.0 <= $3::float8) AS is_allowed\n                            FROM calculation\n                        ),\n                        upsert AS (\n                            INSERT INTO underway.global_rate_limit (id, tokens_used, window_start)\n                            SELECT $1, 1.0, arrival_time FROM decision WHERE is_allowed = true\n                            ON CONFLICT (id) DO UPDATE\n                            SET\n                                tokens_used = (SELECT current_tokens FROM decision) + 1.0,\n                                window_start = (SELECT arrival_time FROM decision)\n                            WHERE (SELECT is_allowed FROM decision) = true\n                        )\n                        SELECT\n                            is_allowed AS \"is_allowed!\",\n                            current_tokens AS \"current_tokens!\"\n                        FROM decision\n                        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "is_allowed!",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 1,
+        "name": "current_tokens!",
+        "type_info": "Float8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Float8",
+        "Float8"
+      ]
+    },
+    "nullable": [
+      null,
+      null
+    ]
+  },
+  "hash": "e05f962d537e9e46d6a52c03217d23e6cbf445e471c802afd23e5c4b782ff041"
+}

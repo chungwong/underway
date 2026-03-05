@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            select exists (\n                select 1 from information_schema.tables\n                where table_schema = 'underway' and\n                      table_name = '_sqlx_migrations'\n            );\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "exists",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "7d6092d086adb954eba6b19e6e7dd29912e8334a5473d449e40350b57ca88003"
+}

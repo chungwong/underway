@@ -834,6 +834,78 @@ impl<T: Task + Sync> Worker<T> {
             .try_into()
             .expect("Task heartbeat should be compatible with std::time");
 
+        // [CUSTOM RATE LIMITER INTERCEPTION]
+        // Check if the user attached a custom rate limiter algorithm (e.g. Token Bucket)
+        if let Some(limiter) = &self.queue.rate_limiter {
+            match limiter.check(&self.queue.name).await {
+                Ok(crate::task::RateLimitDecision::Allowed) => {
+                    // Passed the rate limit, proceed as normal.
+                }
+                Ok(crate::task::RateLimitDecision::Limited { retry_after }) => {
+                    tracing::info!(
+                        queue.name = self.queue.name,
+                        task.id = %task_id,
+                        retry_after_secs = retry_after.as_secs(),
+                        "Task execution postponed by custom rate limiter plugin",
+                    );
+
+                    // Rewrite the task to sleep for `retry_after` Duration
+                    // and safely convert it back to Pending.
+                    let retry_interval =
+                        std::time::Duration::from_nanos(retry_after.as_nanos() as u64); // coerce to basic Duration
+
+                    sqlx::query!(
+                        r#"
+                        UPDATE underway.task
+                        SET state = $2,
+                            run_at = now() + $4,
+                            lease_expires_at = null,
+                            updated_at = now()
+                        WHERE id = $1 AND task_queue_name = $3
+                        "#,
+                        task_id as crate::task::TaskId,
+                        crate::task::State::Pending as crate::task::State,
+                        self.queue.name.clone(),
+                        retry_interval as std::time::Duration // Type mapping accepted by sqlx for 'interval'
+                    )
+                    .execute(&mut *tx)
+                    .await?;
+
+                    // Release the lease attempt so it's not counted as a failure
+                    sqlx::query!(
+                        r#"
+                        DELETE FROM underway.task_attempt
+                        WHERE task_id = $1 AND task_queue_name = $2 AND attempt_number = $3
+                        "#,
+                        task_id as crate::task::TaskId,
+                        self.queue.name.clone(),
+                        in_progress_task.attempt_number
+                    )
+                    .execute(&mut *tx)
+                    .await?;
+
+                    tx.commit().await?;
+
+                    // We successfully bypassed executing the task without "busy waiting".
+                    return Ok(Some(task_id));
+                }
+                Err(e) => {
+                    // The custom rate limiter crashed evaluating this job! Treat as retryable.
+                    tracing::error!(err = %e, "Custom rate limiter plugin failed to execute check");
+                    let retry_policy = &in_progress_task.retry_policy;
+                    self.handle_task_error(
+                        &mut tx,
+                        &in_progress_task,
+                        retry_policy,
+                        &crate::task::Error::Retryable(format!("RateLimiter check failed: {}", e)),
+                    )
+                    .await?;
+                    tx.commit().await?;
+                    return Ok(Some(task_id));
+                }
+            }
+        }
+
         // Spawn a task to send heartbeats alongside task processing.
         let heartbeat_task = tokio::spawn({
             let pool = self.queue.pool.clone();
