@@ -13,7 +13,7 @@ use crate::{
     activity::Activity,
     activity_worker::ActivityRegistry,
     queue::Queue,
-    task::{Result as TaskResult, RetryPolicy},
+    task::{Result as TaskResult, RetryPolicy, UniqueJobStrategy},
 };
 
 pub(super) mod builder_states {
@@ -479,6 +479,36 @@ where
     ) -> Builder<I, Current, S, StepSet<Current, S>, ASet> {
         let step_config = self.steps.last_mut().expect("Steps should not be empty");
         step_config.task_config.concurrency_key = Some(concurrency_key.into());
+
+        Builder {
+            builder_state: StepSet {
+                state: self.builder_state.state,
+                _marker: PhantomData,
+            },
+            steps: self.steps,
+            activity_registry: self.activity_registry,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Sets the unique strategy of the previous step.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use underway::{task::UniqueJobStrategy, Transition, Workflow};
+    ///
+    /// let workflow_builder = Workflow::<(), ()>::builder()
+    ///     .step(|_cx, _| async move { Transition::complete() })
+    ///     .concurrency_key("customer:42")
+    ///     .unique_strategy(UniqueJobStrategy::KeepExisting);
+    /// ```
+    pub fn unique_strategy(
+        mut self,
+        unique_strategy: UniqueJobStrategy,
+    ) -> Builder<I, Current, S, StepSet<Current, S>, ASet> {
+        let step_config = self.steps.last_mut().expect("Steps should not be empty");
+        step_config.task_config.unique_strategy = unique_strategy;
 
         Builder {
             builder_state: StepSet {

@@ -447,8 +447,10 @@ impl<T: Task> Queue<T> {
     where
         E: PgExecutor<'a>,
     {
-        self.enqueue_with_delay(executor, task, input, task.delay_for(input))
-            .await
+        let (task_id, _) = self
+            .enqueue_with_delay(executor, task, input, task.delay_for(input))
+            .await?;
+        Ok(task_id)
     }
 
     /// Same as [`enqueue`](Queue::enqueue), but the task doesn't become
@@ -518,8 +520,10 @@ impl<T: Task> Queue<T> {
         E: PgExecutor<'a>,
     {
         let calculated_delay = task.delay_for(input).checked_add(delay)?;
-        self.enqueue_with_delay(executor, task, input, calculated_delay)
-            .await
+        let (task_id, _) = self
+            .enqueue_with_delay(executor, task, input, calculated_delay)
+            .await?;
+        Ok(task_id)
     }
 
     // Explicitly provide for a delay so that we can also facilitate calculated
@@ -530,13 +534,13 @@ impl<T: Task> Queue<T> {
         fields(queue.name = self.name, task.id = tracing::field::Empty),
         err
     )]
-    async fn enqueue_with_delay<'a, E>(
+    pub(crate) async fn enqueue_with_delay<'a, E>(
         &self,
         executor: E,
         task: &T,
         input: &T::Input,
         delay: Span,
-    ) -> Result<TaskId>
+    ) -> Result<(TaskId, serde_json::Value)>
     where
         E: PgExecutor<'a>,
     {
@@ -561,7 +565,7 @@ impl<T: Task> Queue<T> {
 
         macro_rules! insert_task {
             ($query:expr) => {
-                sqlx::query_scalar!(
+                sqlx::query!(
                     $query,
                     id as TaskId,
                     self.name,
@@ -577,9 +581,9 @@ impl<T: Task> Queue<T> {
             };
         }
 
-        let returned_id = match unique_strategy {
+        let returned = match unique_strategy {
             UniqueJobStrategy::Strict => {
-                insert_task!(
+                let row = insert_task!(
                     r#"
                     insert into underway.task (
                       id,
@@ -594,14 +598,15 @@ impl<T: Task> Queue<T> {
                       concurrency_key,
                       priority
                     ) values ($1, $2, $3, $4, $5, $6, $7, now() + $7, $8, $9, $10)
-                    returning id as "id: TaskId"
+                    returning id as "id: TaskId", input as "input: serde_json::Value"
                     "#
                 )
                 .fetch_one(executor)
-                .await?
+                .await?;
+                (row.id, row.input)
             }
             UniqueJobStrategy::KeepExisting => {
-                insert_task!(
+                let row = insert_task!(
                     r#"
                     with inserted as (
                         insert into underway.task (
@@ -619,11 +624,11 @@ impl<T: Task> Queue<T> {
                         ) values ($1, $2, $3, $4, $5, $6, $7, now() + $7, $8, $9, $10)
                         on conflict (task_queue_name, concurrency_key) where concurrency_key is not null and state in ('pending', 'in_progress')
                         do nothing
-                        returning id
+                        returning id, input
                     )
-                    select id as "id!: TaskId" from inserted
+                    select id as "id!: TaskId", input as "input!: serde_json::Value" from inserted
                     union all
-                    select id as "id!: TaskId"
+                    select id as "id!: TaskId", input as "input!: serde_json::Value"
                     from underway.task
                     where task_queue_name = $2
                       and concurrency_key = $9
@@ -632,10 +637,11 @@ impl<T: Task> Queue<T> {
                     "#
                 )
                 .fetch_one(executor)
-                .await?
+                .await?;
+                (row.id, row.input)
             }
             UniqueJobStrategy::ReplaceExisting => {
-                insert_task!(
+                let row = insert_task!(
                     r#"
                     with inserted as (
                         insert into underway.task (
@@ -663,11 +669,11 @@ impl<T: Task> Queue<T> {
                             priority = EXCLUDED.priority,
                             updated_at = now()
                         where underway.task.state = 'pending'
-                        returning id
+                        returning id, input
                     )
-                    select id as "id!: TaskId" from inserted
+                    select id as "id!: TaskId", input as "input!: serde_json::Value" from inserted
                     union all
-                    select id as "id!: TaskId"
+                    select id as "id!: TaskId", input as "input!: serde_json::Value"
                     from underway.task
                     where task_queue_name = $2
                       and concurrency_key = $9
@@ -676,11 +682,12 @@ impl<T: Task> Queue<T> {
                     "#
                 )
                 .fetch_one(executor)
-                .await?
+                .await?;
+                (row.id, row.input)
             }
         };
 
-        Ok(returned_id)
+        Ok(returned)
     }
 
     /// Enqueues tasks in chunks (max 5000 per batch) within a single
@@ -3123,6 +3130,209 @@ mod tests {
             in_progress_task.concurrency_key,
             Some("/foo/bar".to_string())
         );
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn enqueue_task_with_concurrency_key_strict(pool: PgPool) -> sqlx::Result<(), Error> {
+        let queue = Queue::builder()
+            .name("enqueue_task_with_concurrency_key_strict")
+            .pool(pool.clone())
+            .build()
+            .await?;
+
+        struct MyStrictTask(PathBuf);
+
+        impl Task for MyStrictTask {
+            type Input = ();
+            type Output = ();
+
+            async fn execute(
+                &self,
+                _tx: Transaction<'_, Postgres>,
+                _input: Self::Input,
+            ) -> TaskResult<Self::Output> {
+                Ok(())
+            }
+
+            fn concurrency_key(&self) -> Option<String> {
+                Some(self.0.display().to_string())
+            }
+
+            fn unique_strategy(&self) -> crate::task::UniqueJobStrategy {
+                crate::task::UniqueJobStrategy::Strict
+            }
+        }
+
+        // First enqueue should succeed
+        queue
+            .enqueue(&pool, &MyStrictTask(PathBuf::from("/foo/strict")), &())
+            .await?;
+
+        // Second enqueue with the exact same concurrency key should fail under Strict
+        let result = queue
+            .enqueue(&pool, &MyStrictTask(PathBuf::from("/foo/strict")), &())
+            .await;
+
+        assert!(
+            result.is_err(),
+            "Expected an error due to strict unique job constraint"
+        );
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn enqueue_task_with_concurrency_key_keep_existing(
+        pool: PgPool,
+    ) -> sqlx::Result<(), Error> {
+        let queue = Queue::builder()
+            .name("enqueue_task_with_concurrency_key_keep_existing")
+            .pool(pool.clone())
+            .build()
+            .await?;
+
+        struct MyKeepTask {
+            key: String,
+        }
+
+        impl Task for MyKeepTask {
+            type Input = String;
+            type Output = ();
+
+            async fn execute(
+                &self,
+                _tx: Transaction<'_, Postgres>,
+                _input: Self::Input,
+            ) -> TaskResult<Self::Output> {
+                Ok(())
+            }
+
+            fn concurrency_key(&self) -> Option<String> {
+                Some(self.key.clone())
+            }
+
+            fn unique_strategy(&self) -> crate::task::UniqueJobStrategy {
+                crate::task::UniqueJobStrategy::KeepExisting
+            }
+        }
+
+        // Enqueue the first task
+        let task_id_1 = queue
+            .enqueue(
+                &pool,
+                &MyKeepTask {
+                    key: "my-key".to_string(),
+                },
+                &"initial_input".to_string(),
+            )
+            .await?;
+
+        // Enqueue the second task with the same key
+        let task_id_2 = queue
+            .enqueue(
+                &pool,
+                &MyKeepTask {
+                    key: "my-key".to_string(),
+                },
+                &"new_input".to_string(),
+            )
+            .await?;
+
+        // The IDs should mathematically equal! KeepExisting returns the original ID.
+        assert_eq!(task_id_1, task_id_2);
+
+        // Verify the database state remains 'initial_input'
+        let row = sqlx::query!(
+            r#"
+            select input
+            from underway.task
+            where id = $1
+            "#,
+            task_id_1 as TaskId
+        )
+        .fetch_one(&pool)
+        .await?;
+
+        assert_eq!(row.input.to_string(), "\"initial_input\"");
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn enqueue_task_with_concurrency_key_replace_existing(
+        pool: PgPool,
+    ) -> sqlx::Result<(), Error> {
+        let queue = Queue::builder()
+            .name("enqueue_task_with_concurrency_key_replace_existing")
+            .pool(pool.clone())
+            .build()
+            .await?;
+
+        struct MyReplaceTask {
+            key: String,
+        }
+
+        impl Task for MyReplaceTask {
+            type Input = String;
+            type Output = ();
+
+            async fn execute(
+                &self,
+                _tx: Transaction<'_, Postgres>,
+                _input: Self::Input,
+            ) -> TaskResult<Self::Output> {
+                Ok(())
+            }
+
+            fn concurrency_key(&self) -> Option<String> {
+                Some(self.key.clone())
+            }
+
+            fn unique_strategy(&self) -> crate::task::UniqueJobStrategy {
+                crate::task::UniqueJobStrategy::ReplaceExisting
+            }
+        }
+
+        // Enqueue the first task
+        let task_id_1 = queue
+            .enqueue(
+                &pool,
+                &MyReplaceTask {
+                    key: "my-replace-key".to_string(),
+                },
+                &"initial_input".to_string(),
+            )
+            .await?;
+
+        // Enqueue the second task with the same key and new input
+        let task_id_2 = queue
+            .enqueue(
+                &pool,
+                &MyReplaceTask {
+                    key: "my-replace-key".to_string(),
+                },
+                &"new_input".to_string(),
+            )
+            .await?;
+
+        // The IDs should mathematically equal! ReplaceExisting returns the original ID.
+        assert_eq!(task_id_1, task_id_2);
+
+        // Verify the database state updated to 'new_input'
+        let row = sqlx::query!(
+            r#"
+            select input
+            from underway.task
+            where id = $1
+            "#,
+            task_id_1 as TaskId
+        )
+        .fetch_one(&pool)
+        .await?;
+
+        assert_eq!(row.input.to_string(), "\"new_input\"");
 
         Ok(())
     }

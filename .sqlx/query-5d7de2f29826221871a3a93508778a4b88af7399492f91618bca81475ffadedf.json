@@ -1,0 +1,65 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                    with inserted as (\n                        insert into underway.task (\n                          id,\n                          task_queue_name,\n                          input,\n                          timeout,\n                          heartbeat,\n                          ttl,\n                          delay,\n                          run_at,\n                          retry_policy,\n                          concurrency_key,\n                          priority\n                        ) values ($1, $2, $3, $4, $5, $6, $7, now() + $7, $8, $9, $10)\n                        on conflict (task_queue_name, concurrency_key) where concurrency_key is not null and state in ('pending', 'in_progress')\n                        do update set\n                            input = EXCLUDED.input,\n                            timeout = EXCLUDED.timeout,\n                            heartbeat = EXCLUDED.heartbeat,\n                            ttl = EXCLUDED.ttl,\n                            delay = EXCLUDED.delay,\n                            run_at = EXCLUDED.run_at,\n                            retry_policy = EXCLUDED.retry_policy,\n                            priority = EXCLUDED.priority,\n                            updated_at = now()\n                        where underway.task.state = 'pending'\n                        returning id, input\n                    )\n                    select id as \"id!: TaskId\", input as \"input!: serde_json::Value\" from inserted\n                    union all\n                    select id as \"id!: TaskId\", input as \"input!: serde_json::Value\"\n                    from underway.task\n                    where task_queue_name = $2\n                      and concurrency_key = $9\n                      and state in ('pending', 'in_progress')\n                    limit 1\n                    ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id!: TaskId",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "input!: serde_json::Value",
+        "type_info": "Jsonb"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Jsonb",
+        "Interval",
+        "Interval",
+        "Interval",
+        "Interval",
+        {
+          "Custom": {
+            "name": "underway.task_retry_policy",
+            "kind": {
+              "Composite": [
+                [
+                  "max_attempts",
+                  "Int4"
+                ],
+                [
+                  "initial_interval_ms",
+                  "Int4"
+                ],
+                [
+                  "max_interval_ms",
+                  "Int4"
+                ],
+                [
+                  "backoff_coefficient",
+                  "Float8"
+                ],
+                [
+                  "jitter_factor",
+                  "Float8"
+                ]
+              ]
+            }
+          }
+        },
+        "Text",
+        "Int4"
+      ]
+    },
+    "nullable": [
+      null,
+      null
+    ]
+  },
+  "hash": "5d7de2f29826221871a3a93508778a4b88af7399492f91618bca81475ffadedf"
+}

@@ -1,12 +1,17 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n                    insert into underway.task (\n                      id,\n                      task_queue_name,\n                      input,\n                      timeout,\n                      heartbeat,\n                      ttl,\n                      delay,\n                      run_at,\n                      retry_policy,\n                      concurrency_key,\n                      priority\n                    ) values ($1, $2, $3, $4, $5, $6, $7, now() + $7, $8, $9, $10)\n                    returning id as \"id: TaskId\"\n                    ",
+  "query": "\n                    insert into underway.task (\n                      id,\n                      task_queue_name,\n                      input,\n                      timeout,\n                      heartbeat,\n                      ttl,\n                      delay,\n                      run_at,\n                      retry_policy,\n                      concurrency_key,\n                      priority\n                    ) values ($1, $2, $3, $4, $5, $6, $7, now() + $7, $8, $9, $10)\n                    returning id as \"id: TaskId\", input as \"input: serde_json::Value\"\n                    ",
   "describe": {
     "columns": [
       {
         "ordinal": 0,
         "name": "id: TaskId",
         "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "input: serde_json::Value",
+        "type_info": "Jsonb"
       }
     ],
     "parameters": {
@@ -52,8 +57,9 @@
       ]
     },
     "nullable": [
+      false,
       false
     ]
   },
-  "hash": "f711bfcfec9089ad2acc0a8e6089a8e941679aaf71a041257b4eb4d1c680964f"
+  "hash": "07bdb64d2f31f9bd74dcde21347128623fc2f79a7590fe5ee291db50558ee22e"
 }

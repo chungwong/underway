@@ -4,7 +4,7 @@ use jiff::{Span, ToSpan};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use super::{context::ContextParts, Context};
-use crate::task::{Error as TaskError, Result as TaskResult, RetryPolicy};
+use crate::task::{Error as TaskError, Result as TaskResult, RetryPolicy, UniqueJobStrategy};
 
 pub(super) struct StepConfig<S> {
     pub(super) executor: Box<dyn StepExecutor<S>>,
@@ -37,6 +37,7 @@ pub(super) struct StepTaskConfig {
     pub(super) delay: Span,
     pub(super) heartbeat: Span,
     pub(super) concurrency_key: Option<String>,
+    pub(super) unique_strategy: UniqueJobStrategy,
     pub(super) priority: i32,
 }
 
@@ -49,6 +50,7 @@ impl Default for StepTaskConfig {
             delay: Span::new(),
             heartbeat: 30.seconds(),
             concurrency_key: None,
+            unique_strategy: UniqueJobStrategy::default(),
             priority: 0,
         }
     }

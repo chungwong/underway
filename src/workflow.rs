@@ -732,6 +732,7 @@ use crate::{
     scheduler::{Error as SchedulerError, ZonedSchedule},
     task::{
         Error as TaskError, Result as TaskResult, RetryPolicy, State as TaskState, Task, TaskId,
+        UniqueJobStrategy,
     },
     worker::Error as WorkerError,
     workflow::registration::NoActivities,
@@ -1282,12 +1283,15 @@ where
     {
         let workflow_input = self.first_workflow_input(input)?;
 
-        self.queue
-            .enqueue_after(executor, self, &workflow_input, delay)
+        let (_, input_value) = self
+            .queue
+            .enqueue_with_delay(executor, self, &workflow_input, delay)
             .await?;
 
+        let state: WorkflowState = serde_json::from_value(input_value)?;
+
         let enqueue = EnqueuedWorkflow {
-            run_id: workflow_input.workflow_run_id,
+            run_id: state.workflow_run_id,
             queue: self.queue.clone(),
         };
 
@@ -1804,6 +1808,10 @@ where
         self.step_task_config(0).priority
     }
 
+    fn unique_strategy(&self) -> UniqueJobStrategy {
+        self.step_task_config(0).unique_strategy
+    }
+
     fn retry_policy_for(&self, input: &Self::Input) -> RetryPolicy {
         self.step_task_config(input.step_index).retry_policy
     }
@@ -1830,6 +1838,10 @@ where
 
     fn priority_for(&self, input: &Self::Input) -> i32 {
         self.step_task_config(input.step_index).priority
+    }
+
+    fn unique_strategy_for(&self, input: &Self::Input) -> UniqueJobStrategy {
+        self.step_task_config(input.step_index).unique_strategy
     }
 }
 
@@ -3261,6 +3273,46 @@ mod tests {
 
         // Should return `false` since the workflow is already cancelled.
         assert!(!enqueued_workflow.cancel().await?);
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn unique_strategy_keep_existing(pool: PgPool) -> sqlx::Result<(), Error> {
+        let queue = Queue::builder()
+            .name("unique_strategy_keep_existing")
+            .pool(pool.clone())
+            .build()
+            .await?;
+
+        let workflow = Workflow::builder()
+            .step(|_cx, _| async move { Transition::complete() })
+            .concurrency_key("unique-key")
+            .unique_strategy(UniqueJobStrategy::KeepExisting)
+            .queue(queue.clone())
+            .build();
+
+        // Enqueue the first one.
+        let first_enqueued = workflow.enqueue(&()).await?;
+
+        // Enqueue the second one with the same key.
+        let second_enqueued = workflow.enqueue(&()).await?;
+
+        // Both enqueues should return the same run ID because of KeepExisting.
+        assert_eq!(first_enqueued.run_id, second_enqueued.run_id);
+
+        let tasks_count: i64 = sqlx::query_scalar(
+            r#"
+            select count(*)
+            from underway.task
+            where task_queue_name = $1
+            "#,
+        )
+        .bind(queue.name.clone())
+        .fetch_one(&pool)
+        .await?;
+
+        assert_eq!(tasks_count, 1);
 
         Ok(())
     }
