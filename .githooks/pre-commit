@@ -1,0 +1,18 @@
+#!/bin/sh
+
+# The script exits if any commands fail
+set -e
+
+# Format checks
+echo "Running 'cargo fmt'..."
+cargo fmt --all -- --check
+
+# Lints checking
+echo "Running 'cargo clippy'..."
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+# Verifying SQLx queries are prepared and up to date
+echo "Running 'sqlx prepare --check'..."
+cargo sqlx prepare --workspace --check -- --all-targets --all-features
+
+echo "✅ All pre-commit checks passed successfully!"
