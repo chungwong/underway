@@ -169,12 +169,12 @@ pub enum UniqueJobStrategy {
 
     /// Keep the existing task and skip enqueueing the new one. The existing
     /// task ID is returned.
-    KeepExisting,
+    DoNothing,
 
     /// Update the existing pending task with the new input and schedule. If the
-    /// task is already in progress, it behaves like `KeepExisting`. The existing
+    /// task is already in progress, it behaves like `DoNothing`. The existing
     /// task ID is returned.
-    ReplaceExisting,
+    Replace,
 }
 
 /// The result returned by a custom [`RateLimiter`].

@@ -3278,9 +3278,9 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn unique_strategy_keep_existing(pool: PgPool) -> sqlx::Result<(), Error> {
+    async fn unique_strategy_do_nothing(pool: PgPool) -> sqlx::Result<(), Error> {
         let queue = Queue::builder()
-            .name("unique_strategy_keep_existing")
+            .name("unique_strategy_do_nothing")
             .pool(pool.clone())
             .build()
             .await?;
@@ -3288,7 +3288,7 @@ mod tests {
         let workflow = Workflow::builder()
             .step(|_cx, _| async move { Transition::complete() })
             .concurrency_key("unique-key")
-            .unique_strategy(UniqueJobStrategy::KeepExisting)
+            .unique_strategy(UniqueJobStrategy::DoNothing)
             .queue(queue.clone())
             .build();
 
@@ -3298,7 +3298,7 @@ mod tests {
         // Enqueue the second one with the same key.
         let second_enqueued = workflow.enqueue(&()).await?;
 
-        // Both enqueues should return the same run ID because of KeepExisting.
+        // Both enqueues should return the same run ID because of DoNothing.
         assert_eq!(first_enqueued.run_id, second_enqueued.run_id);
 
         let tasks_count: i64 = sqlx::query_scalar(

@@ -605,7 +605,7 @@ impl<T: Task> Queue<T> {
                 .await?;
                 (row.id, row.input)
             }
-            UniqueJobStrategy::KeepExisting => {
+            UniqueJobStrategy::DoNothing => {
                 let row = insert_task!(
                     r#"
                     with inserted as (
@@ -640,7 +640,7 @@ impl<T: Task> Queue<T> {
                 .await?;
                 (row.id, row.input)
             }
-            UniqueJobStrategy::ReplaceExisting => {
+            UniqueJobStrategy::Replace => {
                 let row = insert_task!(
                     r#"
                     with inserted as (
@@ -829,10 +829,10 @@ impl<T: Task> Queue<T> {
 
                 let conflict_clause = match batch_config.unique_strategy {
                     UniqueJobStrategy::Strict => "",
-                    UniqueJobStrategy::KeepExisting => {
+                    UniqueJobStrategy::DoNothing => {
                         "on conflict (task_queue_name, concurrency_key) where concurrency_key is not null and state in ('pending', 'in_progress') do nothing"
                     }
-                    UniqueJobStrategy::ReplaceExisting => {
+                    UniqueJobStrategy::Replace => {
                         "on conflict (task_queue_name, concurrency_key) where concurrency_key is not null and state in ('pending', 'in_progress') do update set input = EXCLUDED.input, timeout = EXCLUDED.timeout, heartbeat = EXCLUDED.heartbeat, ttl = EXCLUDED.ttl, delay = EXCLUDED.delay, run_at = EXCLUDED.run_at, retry_policy = EXCLUDED.retry_policy, priority = EXCLUDED.priority, updated_at = now() where underway.task.state = 'pending'"
                     }
                 };
@@ -2706,16 +2706,16 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn enqueue_task_keep_existing(pool: PgPool) -> sqlx::Result<(), Error> {
+    async fn enqueue_task_do_nothing(pool: PgPool) -> sqlx::Result<(), Error> {
         let queue = Queue::builder()
-            .name("test_enqueue_keep_existing")
+            .name("test_enqueue_do_nothing")
             .pool(pool.clone())
             .build()
             .await?;
 
-        struct KeepExistingTask;
+        struct DoNothingTask;
 
-        impl Task for KeepExistingTask {
+        impl Task for DoNothingTask {
             type Input = i32;
             type Output = ();
 
@@ -2732,12 +2732,12 @@ mod tests {
             }
 
             fn unique_strategy(&self) -> UniqueJobStrategy {
-                UniqueJobStrategy::KeepExisting
+                UniqueJobStrategy::DoNothing
             }
         }
 
-        let task_id1 = queue.enqueue(&pool, &KeepExistingTask, &1).await?;
-        let task_id2 = queue.enqueue(&pool, &KeepExistingTask, &2).await?;
+        let task_id1 = queue.enqueue(&pool, &DoNothingTask, &1).await?;
+        let task_id2 = queue.enqueue(&pool, &DoNothingTask, &2).await?;
 
         assert_eq!(task_id1, task_id2);
 
@@ -2754,16 +2754,16 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn enqueue_task_replace_existing(pool: PgPool) -> sqlx::Result<(), Error> {
+    async fn enqueue_task_replace(pool: PgPool) -> sqlx::Result<(), Error> {
         let queue = Queue::builder()
-            .name("test_enqueue_replace_existing")
+            .name("test_enqueue_replace")
             .pool(pool.clone())
             .build()
             .await?;
 
-        struct ReplaceExistingTask;
+        struct ReplaceTask;
 
-        impl Task for ReplaceExistingTask {
+        impl Task for ReplaceTask {
             type Input = i32;
             type Output = ();
 
@@ -2780,12 +2780,12 @@ mod tests {
             }
 
             fn unique_strategy(&self) -> UniqueJobStrategy {
-                UniqueJobStrategy::ReplaceExisting
+                UniqueJobStrategy::Replace
             }
         }
 
-        let task_id1 = queue.enqueue(&pool, &ReplaceExistingTask, &1).await?;
-        let task_id2 = queue.enqueue(&pool, &ReplaceExistingTask, &2).await?;
+        let task_id1 = queue.enqueue(&pool, &ReplaceTask, &1).await?;
+        let task_id2 = queue.enqueue(&pool, &ReplaceTask, &2).await?;
 
         assert_eq!(task_id1, task_id2);
 
@@ -3214,7 +3214,7 @@ mod tests {
             }
 
             fn unique_strategy(&self) -> crate::task::UniqueJobStrategy {
-                crate::task::UniqueJobStrategy::KeepExisting
+                crate::task::UniqueJobStrategy::DoNothing
             }
         }
 
@@ -3240,7 +3240,7 @@ mod tests {
             )
             .await?;
 
-        // The IDs should mathematically equal! KeepExisting returns the original ID.
+        // The IDs should mathematically equal! DoNothing returns the original ID.
         assert_eq!(task_id_1, task_id_2);
 
         // Verify the database state remains 'initial_input'
@@ -3291,7 +3291,7 @@ mod tests {
             }
 
             fn unique_strategy(&self) -> crate::task::UniqueJobStrategy {
-                crate::task::UniqueJobStrategy::ReplaceExisting
+                crate::task::UniqueJobStrategy::Replace
             }
         }
 
@@ -3317,7 +3317,7 @@ mod tests {
             )
             .await?;
 
-        // The IDs should mathematically equal! ReplaceExisting returns the original ID.
+        // The IDs should mathematically equal! Replace returns the original ID.
         assert_eq!(task_id_1, task_id_2);
 
         // Verify the database state updated to 'new_input'

@@ -47,10 +47,10 @@ impl Task for ExampleTask {
 
     fn unique_strategy_for(&self, input: &Self::Input) -> UniqueJobStrategy {
         match input {
-            // Keep the existing sync job if it's already pending, ignoring the new one
-            AppJob::SyncUserMetadata(_) => UniqueJobStrategy::KeepExisting,
+            // Do nothing if the existing sync job is already pending, ignoring the new one
+            AppJob::SyncUserMetadata(_) => UniqueJobStrategy::DoNothing,
             // Replace the existing pending report generation with the newest request
-            AppJob::GenerateReport(_) => UniqueJobStrategy::ReplaceExisting,
+            AppJob::GenerateReport(_) => UniqueJobStrategy::Replace,
             // Error out if a duplicate invoice processing job is enqueued
             AppJob::ProcessInvoice(_) => UniqueJobStrategy::Strict,
         }
@@ -143,8 +143,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Wait for the first job to finish processing
     tokio::time::sleep(Duration::from_secs(1)).await;
 
-    // 2. KeepExisting Strategy
-    println!("\n--- KeepExisting Strategy ---");
+    // 2. DoNothing Strategy
+    println!("\n--- DoNothing Strategy ---");
     println!("Enqueueing initial sync for user-123");
 
     queue
@@ -174,8 +174,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Wait for the first job to finish processing
     tokio::time::sleep(Duration::from_secs(1)).await;
 
-    // 3. ReplaceExisting Strategy
-    println!("\n--- ReplaceExisting Strategy ---");
+    // 3. Replace Strategy
+    println!("\n--- Replace Strategy ---");
     println!("Enqueueing first report generation for report-1");
 
     // We'll enqueue it with a delay so it stays pending while we enqueue the second one

@@ -501,7 +501,7 @@ where
     /// let workflow_builder = Workflow::<(), ()>::builder()
     ///     .step(|_cx, _| async move { Transition::complete() })
     ///     .concurrency_key("customer:42")
-    ///     .unique_strategy(UniqueJobStrategy::KeepExisting);
+    ///     .unique_strategy(UniqueJobStrategy::DoNothing);
     /// ```
     pub fn unique_strategy(
         mut self,
