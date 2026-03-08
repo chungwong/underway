@@ -77,7 +77,7 @@
 //!
 //! For durable side effects beyond plain step chaining, workflows can invoke
 //! activities through
-//! [`workflow::InvokeActivity`](crate::workflow::InvokeActivity).
+//! //! [`workflow::InvokeActivity`].
 //!
 //! - `call` is request/response and may suspend a step until the activity
 //!   completes.
@@ -361,8 +361,8 @@
 //! ## Activities
 //!
 //! Activities are durable side-effect handlers invoked from workflow steps
-//! through [`workflow::InvokeActivity::call`](crate::workflow::InvokeActivity::call)
-//! and [`workflow::InvokeActivity::emit`](crate::workflow::InvokeActivity::emit).
+//! through [`workflow::InvokeActivity::call`]
+//! and [`workflow::InvokeActivity::emit`].
 //!
 //! See [`activity`] for more details about activity handlers and errors.
 //!
