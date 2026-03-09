@@ -763,6 +763,10 @@ pub enum Error {
     #[error(transparent)]
     Json(#[from] serde_json::Error),
 
+    /// Error returned from jiff.
+    #[error(transparent)]
+    Jiff(#[from] jiff::Error),
+
     /// Error returned from database operations.
     #[error(transparent)]
     Database(#[from] sqlx::Error),
@@ -1283,6 +1287,7 @@ where
     {
         let workflow_input = self.first_workflow_input(input)?;
 
+        let delay = self.delay_for(&workflow_input).checked_add(delay)?;
         let (_, input_value) = self
             .queue
             .enqueue_with_delay(executor, self, &workflow_input, delay)
