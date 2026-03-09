@@ -479,6 +479,54 @@ where
     ) -> Builder<I, Current, S, StepSet<Current, S>, ASet> {
         let step_config = self.steps.last_mut().expect("Steps should not be empty");
         step_config.task_config.concurrency_key = Some(concurrency_key.into());
+        step_config.task_config.concurrency_key_fn = None;
+
+        Builder {
+            builder_state: StepSet {
+                state: self.builder_state.state,
+                _marker: PhantomData,
+            },
+            steps: self.steps,
+            activity_registry: self.activity_registry,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Sets the concurrency key of the previous step using a function of the
+    /// input.
+    ///
+    /// This allows the concurrency key to be derived dynamically from the task
+    /// input.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use serde::{Deserialize, Serialize};
+    /// use underway::{Transition, Workflow};
+    ///
+    /// #[derive(Serialize, Deserialize)]
+    /// struct Input {
+    ///     id: usize,
+    /// }
+    ///
+    /// let workflow_builder = Workflow::<Input, ()>::builder()
+    ///     .step(|_cx, _| async move { Transition::complete() })
+    ///     .concurrency_key_with(|input: Input| Some(format!("id:{}", input.id)));
+    /// ```
+    pub fn concurrency_key_with<T, F>(
+        mut self,
+        f: F,
+    ) -> Builder<I, Current, S, StepSet<Current, S>, ASet>
+    where
+        T: DeserializeOwned + 'static,
+        F: Fn(T) -> Option<String> + Send + Sync + 'static,
+    {
+        let step_config = self.steps.last_mut().expect("Steps should not be empty");
+        step_config.task_config.concurrency_key = None;
+        step_config.task_config.concurrency_key_fn = Some(Arc::new(move |value| {
+            let input: T = serde_json::from_value(value).ok()?;
+            f(input)
+        }));
 
         Builder {
             builder_state: StepSet {

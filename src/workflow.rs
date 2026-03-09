@@ -1833,7 +1833,12 @@ where
     }
 
     fn concurrency_key_for(&self, input: &Self::Input) -> Option<String> {
-        self.step_task_config(input.step_index).concurrency_key
+        let config = self.step_task_config(input.step_index);
+        if let Some(f) = &config.concurrency_key_fn {
+            f(input.step_input.clone())
+        } else {
+            config.concurrency_key.clone()
+        }
     }
 
     fn priority_for(&self, input: &Self::Input) -> i32 {

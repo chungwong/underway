@@ -707,34 +707,31 @@ impl<T: Task + Sync> Worker<T> {
         concurrency_limit: Arc<Semaphore>,
         processing_tasks: &mut JoinSet<()>,
     ) {
-        let Ok(permit) = concurrency_limit.try_acquire_owned() else {
-            tracing::trace!("Concurrency limit reached");
-            return;
-        };
-
-        processing_tasks.spawn({
-            let worker = self.clone();
-            async move {
-                while !worker.shutdown_token.is_cancelled() {
-                    match worker.process_next_task().await {
-                        Err(err) => {
-                            tracing::error!(err = %err, "Error processing next task");
-                            continue;
-                        }
-                        Ok(Some(_)) => {
-                            // Since we just processed a task, we'll try again in case there's more.
-                            continue;
-                        }
-                        Ok(None) => {
-                            // We tried to process a task but found none so we'll stop trying.
-                            tracing::trace!("No task found");
-                            break;
+        while let Ok(permit) = concurrency_limit.clone().try_acquire_owned() {
+            processing_tasks.spawn({
+                let worker = self.clone();
+                async move {
+                    while !worker.shutdown_token.is_cancelled() {
+                        match worker.process_next_task().await {
+                            Err(err) => {
+                                tracing::error!(err = %err, "Error processing next task");
+                                continue;
+                            }
+                            Ok(Some(_)) => {
+                                // Since we just processed a task, we'll try again in case there's more.
+                                continue;
+                            }
+                            Ok(None) => {
+                                // We tried to process a task but found none so we'll stop trying.
+                                tracing::trace!("No task found");
+                                break;
+                            }
                         }
                     }
+                    drop(permit);
                 }
-                drop(permit);
-            }
-        });
+            });
+        }
     }
 
     /// Processes the next available task in the queue.

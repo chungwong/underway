@@ -235,7 +235,10 @@
 //! ```
 
 use std::sync::Arc;
-use std::{borrow::Cow, marker::PhantomData, sync::OnceLock, time::Duration as StdDuration};
+use std::{
+    borrow::Cow, collections::HashSet, marker::PhantomData, sync::OnceLock,
+    time::Duration as StdDuration,
+};
 
 use crate::task::RateLimiter;
 use builder_states::{Initial, NameSet, PoolSet};
@@ -260,7 +263,6 @@ struct BatchTaskConfig {
     timeout: StdDuration,
     heartbeat: StdDuration,
     ttl: StdDuration,
-    concurrency_key: Option<String>,
     priority: i32,
     unique_strategy: UniqueJobStrategy,
 }
@@ -295,6 +297,11 @@ pub enum Error {
     /// Indicates that the schedule associated with the task is malformed.
     #[error("A malformed schedule was retrieved.")]
     MalformedSchedule,
+
+    /// Indicates that a batch of tasks contains duplicate concurrency keys with a
+    /// unique strategy that results in multiple updates to the same row.
+    #[error("Batch contains duplicate concurrency key '{0}' with a unique strategy that results in multiple updates to the same row. PostgreSQL forbids this in a single statement.")]
+    BatchUniqueConstraint(String),
 }
 
 /// Task queue.
@@ -793,6 +800,7 @@ impl<T: Task> Queue<T> {
             let mut input_values = Vec::with_capacity(chunk.len());
             let mut delays = Vec::with_capacity(chunk.len());
             let mut configs = Vec::with_capacity(chunk.len());
+            let mut concurrency_keys = Vec::with_capacity(chunk.len());
 
             for input in chunk {
                 ids.push(TaskId::new());
@@ -803,10 +811,10 @@ impl<T: Task> Queue<T> {
                     timeout: StdDuration::try_from(task.timeout_for(input))?,
                     heartbeat: StdDuration::try_from(task.heartbeat_for(input))?,
                     ttl: StdDuration::try_from(task.ttl_for(input))?,
-                    concurrency_key: task.concurrency_key_for(input),
                     priority: task.priority_for(input),
                     unique_strategy: task.unique_strategy_for(input),
                 });
+                concurrency_keys.push(task.concurrency_key_for(input));
             }
 
             if configs.is_empty() {
@@ -816,26 +824,34 @@ impl<T: Task> Queue<T> {
             let batch_config = configs.first().expect("Batch config should exist").clone();
             let uniform_config = configs.iter().all(|config| config == &batch_config);
 
+            if batch_config.unique_strategy == UniqueJobStrategy::Replace {
+                let mut unique_keys = HashSet::new();
+                for key in concurrency_keys.iter().flatten() {
+                    if !unique_keys.insert(key.clone()) {
+                        return Err(Error::BatchUniqueConstraint(key.clone()));
+                    }
+                }
+            }
+
+            let conflict_clause = match batch_config.unique_strategy {
+                UniqueJobStrategy::Strict => "",
+                UniqueJobStrategy::DoNothing => {
+                    "on conflict (task_queue_name, concurrency_key) where concurrency_key is not null and state in ('pending', 'in_progress') do nothing"
+                }
+                UniqueJobStrategy::Replace => {
+                    "on conflict (task_queue_name, concurrency_key) where concurrency_key is not null and state in ('pending', 'in_progress') do update set input = EXCLUDED.input, timeout = EXCLUDED.timeout, heartbeat = EXCLUDED.heartbeat, ttl = EXCLUDED.ttl, delay = EXCLUDED.delay, run_at = EXCLUDED.run_at, retry_policy = EXCLUDED.retry_policy, priority = EXCLUDED.priority, updated_at = now() where underway.task.state = 'pending'"
+                }
+            };
+
             if uniform_config {
                 let BatchTaskConfig {
                     retry_policy,
                     timeout,
                     heartbeat,
                     ttl,
-                    concurrency_key,
                     priority,
                     unique_strategy: _,
                 } = batch_config.clone();
-
-                let conflict_clause = match batch_config.unique_strategy {
-                    UniqueJobStrategy::Strict => "",
-                    UniqueJobStrategy::DoNothing => {
-                        "on conflict (task_queue_name, concurrency_key) where concurrency_key is not null and state in ('pending', 'in_progress') do nothing"
-                    }
-                    UniqueJobStrategy::Replace => {
-                        "on conflict (task_queue_name, concurrency_key) where concurrency_key is not null and state in ('pending', 'in_progress') do update set input = EXCLUDED.input, timeout = EXCLUDED.timeout, heartbeat = EXCLUDED.heartbeat, ttl = EXCLUDED.ttl, delay = EXCLUDED.delay, run_at = EXCLUDED.run_at, retry_policy = EXCLUDED.retry_policy, priority = EXCLUDED.priority, updated_at = now() where underway.task.state = 'pending'"
-                    }
-                };
 
                 let query_string = format!(
                     r#"
@@ -862,13 +878,14 @@ impl<T: Task> Queue<T> {
                   t.delay,
                   now() + t.delay,
                   $5 as retry_policy,
-                  $6 as concurrency_key,
-                  $7 as priority
+                  t.concurrency_key,
+                  $6 as priority
                 from unnest(
-                  $8::uuid[],
-                  $9::jsonb[],
-                  $10::interval[]
-                ) as t(id, input, delay)
+                  $7::uuid[],
+                  $8::jsonb[],
+                  $9::interval[],
+                  $10::text[]
+                ) as t(id, input, delay, concurrency_key)
                 {}
                 "#,
                     conflict_clause
@@ -880,11 +897,11 @@ impl<T: Task> Queue<T> {
                     .bind(heartbeat as StdDuration)
                     .bind(ttl as StdDuration)
                     .bind(retry_policy as RetryPolicy)
-                    .bind(&concurrency_key)
                     .bind(priority)
                     .bind(&ids)
                     .bind(&input_values)
                     .bind(&delays)
+                    .bind(&concurrency_keys)
                     .execute(tx.as_mut())
                     .await?;
             } else {
@@ -896,7 +913,6 @@ impl<T: Task> Queue<T> {
                 let mut retry_max_interval_ms = Vec::with_capacity(chunk.len());
                 let mut retry_backoff_coefficients = Vec::with_capacity(chunk.len());
                 let mut retry_jitter_factors = Vec::with_capacity(chunk.len());
-                let mut concurrency_keys = Vec::with_capacity(chunk.len());
                 let mut priorities = Vec::with_capacity(chunk.len());
 
                 for config in &configs {
@@ -908,17 +924,10 @@ impl<T: Task> Queue<T> {
                     retry_max_interval_ms.push(config.retry_policy.max_interval_ms);
                     retry_backoff_coefficients.push(config.retry_policy.backoff_coefficient);
                     retry_jitter_factors.push(config.retry_policy.jitter_factor);
-                    concurrency_keys.push(config.concurrency_key.clone());
                     priorities.push(config.priority);
                 }
 
-                // The user expects `unique_strategy` to work per task in `enqueue_many`, however, dynamic batch updates
-                // of a `ON CONFLICT` strategy on a row-by-row basis are not possible to easily pack into a
-                // single `INSERT ... SELECT ...` query without some complex SQL.
-                // We will fall back to strict on conflict, or we can just apply `do nothing` if we wanted to
-                // but checking conflicts individually is harder. Since `Strict` is default, and mixed strategies
-                // are unlikely, we will just use the normal query (which acts as Strict).
-                sqlx::query!(
+                let query_string = format!(
                     r#"
                 insert into underway.task (
                   id,
@@ -980,24 +989,28 @@ impl<T: Task> Queue<T> {
                   concurrency_key,
                   priority
                 )
+                {}
                 "#,
-                    self.name,
-                    &ids as _,
-                    &input_values,
-                    &timeouts as _,
-                    &heartbeats as _,
-                    &ttls as _,
-                    &delays as _,
-                    &retry_max_attempts as _,
-                    &retry_initial_interval_ms as _,
-                    &retry_max_interval_ms as _,
-                    &retry_backoff_coefficients as _,
-                    &retry_jitter_factors as _,
-                    &concurrency_keys as _,
-                    &priorities as _,
-                )
-                .execute(tx.as_mut())
-                .await?;
+                    conflict_clause
+                );
+
+                sqlx::query(&query_string)
+                    .bind(&self.name)
+                    .bind(&ids)
+                    .bind(&input_values)
+                    .bind(&timeouts)
+                    .bind(&heartbeats)
+                    .bind(&ttls)
+                    .bind(&delays)
+                    .bind(&retry_max_attempts)
+                    .bind(&retry_initial_interval_ms)
+                    .bind(&retry_max_interval_ms)
+                    .bind(&retry_backoff_coefficients)
+                    .bind(&retry_jitter_factors)
+                    .bind(&concurrency_keys)
+                    .bind(&priorities)
+                    .execute(tx.as_mut())
+                    .await?;
             }
 
             task_ids.extend(ids);

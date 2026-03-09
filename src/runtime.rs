@@ -132,6 +132,7 @@ where
 {
     workflow: Workflow<I, S>,
     activity_worker: ActivityWorker,
+    concurrency_limit: Option<usize>,
 }
 
 impl<I, S> Clone for Runtime<I, S>
@@ -143,6 +144,7 @@ where
         Self {
             workflow: self.workflow.clone(),
             activity_worker: self.activity_worker.clone(),
+            concurrency_limit: self.concurrency_limit,
         }
     }
 }
@@ -164,7 +166,14 @@ where
         Self {
             workflow,
             activity_worker,
+            concurrency_limit: None,
         }
+    }
+
+    /// Sets the concurrency limit for the workflow worker.
+    pub fn set_concurrency_limit(mut self, limit: usize) -> Self {
+        self.concurrency_limit = Some(limit);
+        self
     }
 
     /// Returns a reference to the workflow managed by this runtime.
@@ -197,6 +206,9 @@ where
         let shutdown_token = CancellationToken::new();
 
         let mut worker = self.worker();
+        if let Some(limit) = self.concurrency_limit {
+            worker.set_concurrency_limit(limit);
+        }
         worker.set_shutdown_token(shutdown_token.clone());
 
         let mut scheduler = self.scheduler();
@@ -237,6 +249,9 @@ where
         let shutdown_token = CancellationToken::new();
 
         let mut worker = self.worker();
+        if let Some(limit) = self.concurrency_limit {
+            worker.set_concurrency_limit(limit);
+        }
         worker.set_shutdown_token(shutdown_token.clone());
 
         let mut scheduler = self.scheduler();

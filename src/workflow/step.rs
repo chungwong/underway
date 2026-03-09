@@ -29,6 +29,8 @@ impl<S> StepConfig<S> {
     }
 }
 
+pub(super) type ConcurrencyKeyFn = Arc<dyn Fn(serde_json::Value) -> Option<String> + Send + Sync>;
+
 #[derive(Clone)]
 pub(super) struct StepTaskConfig {
     pub(super) retry_policy: RetryPolicy,
@@ -37,6 +39,7 @@ pub(super) struct StepTaskConfig {
     pub(super) delay: Span,
     pub(super) heartbeat: Span,
     pub(super) concurrency_key: Option<String>,
+    pub(super) concurrency_key_fn: Option<ConcurrencyKeyFn>,
     pub(super) unique_strategy: UniqueJobStrategy,
     pub(super) priority: i32,
 }
@@ -50,6 +53,7 @@ impl Default for StepTaskConfig {
             delay: Span::new(),
             heartbeat: 30.seconds(),
             concurrency_key: None,
+            concurrency_key_fn: None,
             unique_strategy: UniqueJobStrategy::default(),
             priority: 0,
         }
