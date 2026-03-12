@@ -1248,7 +1248,7 @@ impl<T: Task> Queue<T> {
                     last_heartbeat_at = now(),
                     attempt_count = t.attempt_count + 1,
                     current_attempt = t.attempt_count + 1,
-                    lease_expires_at = now() + t.heartbeat
+                    lease_expires_at = now() + t.heartbeat + '10 seconds'::interval
                 from available_task
                 where t.task_queue_name = $1
                   and t.id = available_task.id
@@ -1993,7 +1993,7 @@ impl InProgressTask {
             update underway.task
             set updated_at = now(),
                 last_heartbeat_at = now(),
-                lease_expires_at = now() + heartbeat
+                lease_expires_at = now() + heartbeat + '10 seconds'::interval
             where id = $1
               and task_queue_name = $2
               and current_attempt = $3

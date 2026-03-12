@@ -1389,37 +1389,38 @@ mod tests {
         Ok(())
     }
 
+    #[derive(Clone)]
+    struct ControlledTask {
+        started: tokio::sync::mpsc::Sender<()>,
+        finish: Arc<tokio::sync::Notify>,
+    }
+
+    impl Task for ControlledTask {
+        type Input = ();
+        type Output = ();
+
+        async fn execute(
+            &self,
+            _: Transaction<'_, Postgres>,
+            _: Self::Input,
+        ) -> TaskResult<Self::Output> {
+            // Signal that we started
+            let _ = self.started.send(()).await;
+            // Await instantly without sleeping
+            self.finish.notified().await;
+            Ok(())
+        }
+
+        fn heartbeat(&self) -> Span {
+            100.milliseconds()
+        }
+    }
+
     #[sqlx::test]
-    async fn heartbeat_stops_after_task_completion(pool: PgPool) -> sqlx::Result<(), Error> {
-        // Define a controlled task that deterministically signals the test suite
-        #[derive(Clone)]
-        struct ControlledTask {
-            started: Arc<tokio::sync::Notify>,
-            finish: Arc<tokio::sync::Notify>,
-        }
-
-        impl Task for ControlledTask {
-            type Input = ();
-            type Output = ();
-
-            async fn execute(
-                &self,
-                _: Transaction<'_, Postgres>,
-                _: Self::Input,
-            ) -> TaskResult<Self::Output> {
-                // Signal that we started
-                self.started.notify_one();
-                // Await instantly without sleeping
-                self.finish.notified().await;
-                Ok(())
-            }
-
-            fn heartbeat(&self) -> Span {
-                100.milliseconds()
-            }
-        }
-
-        let notify_started = Arc::new(tokio::sync::Notify::new());
+    async fn heartbeat_stops_after_task_completion(
+        pool: PgPool,
+    ) -> sqlx::Result<(), Box<dyn std::error::Error>> {
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::channel(10);
         let notify_finish = Arc::new(tokio::sync::Notify::new());
 
         let queue = Queue::builder()
@@ -1429,7 +1430,7 @@ mod tests {
             .await?;
 
         let task = ControlledTask {
-            started: notify_started.clone(),
+            started: started_tx,
             finish: notify_finish.clone(),
         };
         let task_id = queue.enqueue(&pool, &task, &()).await?;
@@ -1439,7 +1440,7 @@ mod tests {
         let worker_handle = tokio::spawn(async move { worker.run_every(50.milliseconds()).await });
 
         // Instantly wait for the worker to start the task
-        tokio::time::timeout(StdDuration::from_secs(5), notify_started.notified())
+        tokio::time::timeout(StdDuration::from_secs(5), started_rx.recv())
             .await
             .expect("Worker failed to dequeue and start task");
 
@@ -1509,6 +1510,89 @@ mod tests {
             post_completion_task_row.last_heartbeat_at
         );
 
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn parallel_concurrency_pressure(
+        pool: PgPool,
+    ) -> sqlx::Result<(), Box<dyn std::error::Error>> {
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::channel(10);
+        let notify_finish = Arc::new(tokio::sync::Notify::new());
+
+        let queue = Queue::builder()
+            .name("parallel_concurrency_pressure")
+            .pool(pool.clone())
+            .build()
+            .await?;
+
+        let task = ControlledTask {
+            started: started_tx,
+            finish: notify_finish.clone(),
+        };
+
+        // Enqueue 3 tasks
+        let mut task_ids = Vec::new();
+        for _ in 0..3 {
+            task_ids.push(queue.enqueue(&pool, &task, &()).await?);
+        }
+
+        let queue = Arc::new(queue);
+        let mut worker = Worker::new(queue.clone(), task.clone());
+        worker.set_concurrency_limit(3);
+
+        let worker_handle = tokio::spawn(async move { worker.run_every(50.milliseconds()).await });
+
+        // Wait for all 3 tasks to start concurrently
+        for _ in 0..3 {
+            tokio::time::timeout(StdDuration::from_secs(5), started_rx.recv())
+                .await
+                .expect("Worker failed to dequeue and start all tasks concurrently");
+        }
+
+        // Verify that they are all in Progress and have attempt count 1 (no takeovers!)
+        let stats = sqlx::query!(
+            r#"
+            select 
+                count(*) as "total",
+                sum(case when attempt_count = 1 then 1 else 0 end) as "first_attempts"
+            from underway.task
+            where state = $1 and task_queue_name = 'parallel_concurrency_pressure'
+            "#,
+            TaskState::InProgress as TaskState
+        )
+        .fetch_one(&pool)
+        .await?;
+
+        assert_eq!(stats.total, Some(3));
+        assert_eq!(stats.first_attempts, Some(3));
+
+        // Let them finish
+        for _ in 0..3 {
+            notify_finish.notify_one();
+        }
+
+        // Wait for all to succeed
+        tokio::time::timeout(StdDuration::from_secs(5), async {
+            loop {
+                let succeeded = sqlx::query_scalar!(
+                    r#"select count(*) from underway.task where state = $1 and task_queue_name = 'parallel_concurrency_pressure'"#,
+                    TaskState::Succeeded as TaskState
+                )
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+                if succeeded == Some(3) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+                tokio::time::sleep(StdDuration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("Tasks failed to succeed within timeout");
+
+        worker_handle.abort();
         Ok(())
     }
 

@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            update underway.task\n            set updated_at = now(),\n                last_heartbeat_at = now(),\n                lease_expires_at = now() + heartbeat\n            where id = $1\n              and task_queue_name = $2\n              and current_attempt = $3\n              and state = $4\n            ",
+  "query": "\n            update underway.task\n            set updated_at = now(),\n                last_heartbeat_at = now(),\n                lease_expires_at = now() + heartbeat + '10 seconds'::interval\n            where id = $1\n              and task_queue_name = $2\n              and current_attempt = $3\n              and state = $4\n            ",
   "describe": {
     "columns": [],
     "parameters": {
@@ -27,5 +27,5 @@
     },
     "nullable": []
   },
-  "hash": "034814c7ebb1a0354d8ed95a544d579180ddace0cd1d186aa5f45bb3d66032a3"
+  "hash": "1c7d0e005acf087fddfae5fa5066b709eaccc649c0daf40e33e9b31da36b038c"
 }

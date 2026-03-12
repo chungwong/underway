@@ -1,0 +1,36 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select count(*) from underway.task where state = $1 and task_queue_name = 'parallel_concurrency_pressure'",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "count",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        {
+          "Custom": {
+            "name": "underway.task_state",
+            "kind": {
+              "Enum": [
+                "pending",
+                "in_progress",
+                "waiting",
+                "succeeded",
+                "cancelled",
+                "failed"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "588c2898c246fdf4fd00319779cfda4c9515396113b7f260423a9a3f113a9c68"
+}
