@@ -234,13 +234,14 @@
 //! # }
 //! ```
 
-use std::sync::Arc;
 use std::{
-    borrow::Cow, collections::HashSet, marker::PhantomData, sync::OnceLock,
+    borrow::Cow,
+    collections::HashSet,
+    marker::PhantomData,
+    sync::{Arc, OnceLock},
     time::Duration as StdDuration,
 };
 
-use crate::task::RateLimiter;
 use builder_states::{Initial, NameSet, PoolSet};
 use jiff::{Span, ToSpan};
 use sqlx::{
@@ -251,7 +252,10 @@ use tracing::instrument;
 use uuid::Uuid;
 
 use crate::{
-    task::{Error as TaskError, RetryPolicy, State as TaskState, Task, TaskId, UniqueJobStrategy},
+    task::{
+        Error as TaskError, RateLimiter, RetryPolicy, State as TaskState, Task, TaskId,
+        UniqueJobStrategy,
+    },
     ZonedSchedule,
 };
 
@@ -298,9 +302,12 @@ pub enum Error {
     #[error("A malformed schedule was retrieved.")]
     MalformedSchedule,
 
-    /// Indicates that a batch of tasks contains duplicate concurrency keys with a
-    /// unique strategy that results in multiple updates to the same row.
-    #[error("Batch contains duplicate concurrency key '{0}' with a unique strategy that results in multiple updates to the same row. PostgreSQL forbids this in a single statement.")]
+    /// Indicates that a batch of tasks contains duplicate concurrency keys with
+    /// a unique strategy that results in multiple updates to the same row.
+    #[error(
+        "Batch contains duplicate concurrency key '{0}' with a unique strategy that results in \
+         multiple updates to the same row. PostgreSQL forbids this in a single statement."
+    )]
     BatchUniqueConstraint(String),
 }
 
@@ -836,10 +843,16 @@ impl<T: Task> Queue<T> {
             let conflict_clause = match batch_config.unique_strategy {
                 UniqueJobStrategy::Strict => "",
                 UniqueJobStrategy::DoNothing => {
-                    "on conflict (task_queue_name, concurrency_key) where concurrency_key is not null and state in ('pending', 'in_progress') do nothing"
+                    "on conflict (task_queue_name, concurrency_key) where concurrency_key is not \
+                     null and state in ('pending', 'in_progress') do nothing"
                 }
                 UniqueJobStrategy::Replace => {
-                    "on conflict (task_queue_name, concurrency_key) where concurrency_key is not null and state in ('pending', 'in_progress') do update set input = EXCLUDED.input, timeout = EXCLUDED.timeout, heartbeat = EXCLUDED.heartbeat, ttl = EXCLUDED.ttl, delay = EXCLUDED.delay, run_at = EXCLUDED.run_at, retry_policy = EXCLUDED.retry_policy, priority = EXCLUDED.priority, updated_at = now() where underway.task.state = 'pending'"
+                    "on conflict (task_queue_name, concurrency_key) where concurrency_key is not \
+                     null and state in ('pending', 'in_progress') do update set input = \
+                     EXCLUDED.input, timeout = EXCLUDED.timeout, heartbeat = EXCLUDED.heartbeat, \
+                     ttl = EXCLUDED.ttl, delay = EXCLUDED.delay, run_at = EXCLUDED.run_at, \
+                     retry_policy = EXCLUDED.retry_policy, priority = EXCLUDED.priority, \
+                     updated_at = now() where underway.task.state = 'pending'"
                 }
             };
 
@@ -2107,9 +2120,11 @@ where
 }
 
 mod builder_states {
-    use crate::task::RateLimiter;
-    use sqlx::PgPool;
     use std::sync::Arc;
+
+    use sqlx::PgPool;
+
+    use crate::task::RateLimiter;
 
     pub struct Initial;
 
@@ -2243,29 +2258,35 @@ impl<T: Task> Builder<T, NameSet> {
         self
     }
 
-    /// Set the maximum number of concurrent tasks allowed to run for this queue.
+    /// Set the maximum number of concurrent tasks allowed to run for this
+    /// queue.
     ///
-    /// The database will natively enforce this limit across all workers globally.
+    /// The database will natively enforce this limit across all workers
+    /// globally.
     pub fn max_concurrency(mut self, max: i32) -> Self {
         self.state.max_concurrency = Some(max);
         self
     }
 
-    /// Provide a custom `RateLimiter` plugin for complex logic like Token Buckets.
+    /// Provide a custom `RateLimiter` plugin for complex logic like Token
+    /// Buckets.
     ///
-    /// Rate limiters intercept the worker immediately after checkout. If limited,
-    /// the worker postpones the task execution into the future rather than retrying it immediately,
-    /// preventing infinite database "busy waiting" loops.
+    /// Rate limiters intercept the worker immediately after checkout. If
+    /// limited, the worker postpones the task execution into the future
+    /// rather than retrying it immediately, preventing infinite database
+    /// "busy waiting" loops.
     pub fn rate_limiter(mut self, limiter: std::sync::Arc<dyn crate::task::RateLimiter>) -> Self {
         self.state.rate_limiter = Some(limiter);
         self
     }
 
-    /// Add a highly efficient, distributed API rate limit out-of-the-box powered natively by Postgres.
+    /// Add a highly efficient, distributed API rate limit out-of-the-box
+    /// powered natively by Postgres.
     ///
-    /// This utilizes the `underway.global_rate_limit` table to ensure that across all your distributed
-    /// worker processes, tasks on this queue will satisfy the requested enforcement algorithm.
-    /// If the algorithm's limit is reached, tasks are gently delayed (no busy-waiting).
+    /// This utilizes the `underway.global_rate_limit` table to ensure that
+    /// across all your distributed worker processes, tasks on this queue
+    /// will satisfy the requested enforcement algorithm. If the algorithm's
+    /// limit is reached, tasks are gently delayed (no busy-waiting).
     pub fn global_rate_limit(
         mut self,
         id: impl Into<String>,

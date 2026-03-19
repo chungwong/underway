@@ -1883,7 +1883,7 @@ mod tests {
     use crate::{
         activity::{Activity, Error as ActivityError, Result as ActivityResult},
         queue::graceful_shutdown,
-        worker::pg_interval_to_span,
+        worker::{pg_interval_to_span, TaskProcessingResult},
     };
 
     struct EchoActivity;
@@ -2079,8 +2079,8 @@ mod tests {
 
         let runtime_handle = workflow.runtime().start();
 
-        // Await the precise moment the workflow step updates the state and sends a notification!
-        // No arbitrary sleeping or aggressive polling needed.
+        // Await the precise moment the workflow step updates the state and sends a
+        // notification! No arbitrary sleeping or aggressive polling needed.
         tokio::time::timeout(tokio::time::Duration::from_secs(5), state.notify.notified())
             .await
             .expect("Workflow step failed to notify within timeout");
@@ -2600,13 +2600,12 @@ mod tests {
             .pool(pool.clone())
             .build()
             .await?;
-
         workflow.enqueue(&()).await?;
 
         // Process the first task.
-        let task_id = workflow.runtime().worker().process_next_task().await?;
+        let res = workflow.runtime().worker().process_next_task().await?;
 
-        assert!(task_id.is_some());
+        assert!(matches!(res, TaskProcessingResult::Processed(_)));
 
         Ok(())
     }

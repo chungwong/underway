@@ -169,6 +169,17 @@ pub enum Error {
     Jiff(#[from] jiff::Error),
 }
 
+/// The result of attempting to process the next task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskProcessingResult {
+    /// No task was found in the queue.
+    NoTask,
+    /// A task was successfully processed (or failed/retried).
+    Processed(TaskId),
+    /// A task was found but postponed due to a rate limit.
+    RateLimited(TaskId, Duration),
+}
+
 /// A worker that's generic over the task it processes.
 #[derive(Debug)]
 pub struct Worker<T: Task> {
@@ -581,6 +592,17 @@ impl<T: Task + Sync> Worker<T> {
         let concurrency_limit = Arc::new(Semaphore::new(self.concurrency_limit));
         let mut processing_tasks = JoinSet::new();
 
+        // Internally used to wake up the main loop without polling.
+        let (wakeup_tx, mut wakeup_rx) = tokio::sync::mpsc::channel(64);
+
+        // Pre-fill tasks
+        self.trigger_task_processing(
+            concurrency_limit.clone(),
+            &mut processing_tasks,
+            wakeup_tx.clone(),
+        )
+        .await;
+
         // Outer loop: handle reconnection logic
         'reconnect: loop {
             // Connect to PostgreSQL listeners with retry logic
@@ -603,11 +625,18 @@ impl<T: Task + Sync> Worker<T> {
                         }
 
                         reap_completed(&mut processing_tasks);
+                        // Slot available! Immediately try to fill it.
+                        self.trigger_task_processing(concurrency_limit.clone(), &mut processing_tasks, wakeup_tx.clone()).await;
                     }
 
                     _ = self.shutdown_token.cancelled() => {
                         self.handle_shutdown(&mut processing_tasks).await?;
                         return Ok(());
+                    }
+
+                    _ = wakeup_rx.recv() => {
+                        // Wakeup event (timer or manual signal). Try filling slots.
+                        self.trigger_task_processing(concurrency_limit.clone(), &mut processing_tasks, wakeup_tx.clone()).await;
                     }
 
                     notification = listener.recv() => {
@@ -618,7 +647,7 @@ impl<T: Task + Sync> Worker<T> {
                                         self.shutdown_token.cancel();
                                     }
                                     "task_change" => {
-                                        self.handle_task_change(notification, concurrency_limit.clone(), &mut processing_tasks).await?;
+                                        self.handle_task_change(notification, concurrency_limit.clone(), &mut processing_tasks, wakeup_tx.clone()).await?;
                                     }
                                     channel => {
                                         tracing::trace!(%channel, "Ignoring notification on unexpected channel");
@@ -632,9 +661,9 @@ impl<T: Task + Sync> Worker<T> {
                         }
                     }
 
-                    // Pending task polling fallback
+                    // Pending task polling fallback (kept as ultra-long safety, but effectively disabled by event-driven logic)
                     _ = polling_interval.tick() => {
-                        self.trigger_task_processing(concurrency_limit.clone(), &mut processing_tasks).await;
+                        self.trigger_task_processing(concurrency_limit.clone(), &mut processing_tasks, wakeup_tx.clone()).await;
                     }
                 }
             }
@@ -680,6 +709,7 @@ impl<T: Task + Sync> Worker<T> {
         task_change: PgNotification,
         concurrency_limit: Arc<Semaphore>,
         processing_tasks: &mut JoinSet<()>,
+        wakeup_tx: tokio::sync::mpsc::Sender<()>,
     ) -> Result {
         let payload = task_change.payload();
         let decoded: TaskChange = serde_json::from_str(payload).map_err(|err| {
@@ -688,7 +718,7 @@ impl<T: Task + Sync> Worker<T> {
         })?;
 
         if decoded.queue_name == self.queue.name {
-            self.trigger_task_processing(concurrency_limit, processing_tasks)
+            self.trigger_task_processing(concurrency_limit, processing_tasks, wakeup_tx)
                 .await;
         }
 
@@ -706,10 +736,12 @@ impl<T: Task + Sync> Worker<T> {
         &self,
         concurrency_limit: Arc<Semaphore>,
         processing_tasks: &mut JoinSet<()>,
+        wakeup_tx: tokio::sync::mpsc::Sender<()>,
     ) {
         while let Ok(permit) = concurrency_limit.clone().try_acquire_owned() {
             processing_tasks.spawn({
                 let worker = self.clone();
+                let wakeup_tx = wakeup_tx.clone();
                 async move {
                     while !worker.shutdown_token.is_cancelled() {
                         match worker.process_next_task().await {
@@ -717,11 +749,21 @@ impl<T: Task + Sync> Worker<T> {
                                 tracing::error!(err = %err, "Error processing next task");
                                 continue;
                             }
-                            Ok(Some(_)) => {
-                                // Since we just processed a task, we'll try again in case there's more.
+                            Ok(TaskProcessingResult::Processed(_)) => {
+                                // Since we just processed a task, we'll try again in case there's
+                                // more.
                                 continue;
                             }
-                            Ok(None) => {
+                            Ok(TaskProcessingResult::RateLimited(_, retry_after)) => {
+                                // We hit a rate limit. Schedule a wakeup and stop this worker loop
+                                // for now.
+                                tokio::spawn(async move {
+                                    tokio::time::sleep(retry_after).await;
+                                    let _ = wakeup_tx.send(()).await;
+                                });
+                                break;
+                            }
+                            Ok(TaskProcessingResult::NoTask) => {
                                 // We tried to process a task but found none so we'll stop trying.
                                 tracing::trace!("No task found");
                                 break;
@@ -803,11 +845,11 @@ impl<T: Task + Sync> Worker<T> {
         ),
         err
     )]
-    pub async fn process_next_task(&self) -> Result<Option<TaskId>> {
+    pub async fn process_next_task(&self) -> Result<TaskProcessingResult> {
         let mut conn = self.queue.pool.acquire().await?;
 
         let Some(in_progress_task) = self.queue.dequeue_from_conn(&mut conn).await? else {
-            return Ok(None);
+            return Ok(TaskProcessingResult::NoTask);
         };
 
         let task_id = in_progress_task.id;
@@ -818,7 +860,7 @@ impl<T: Task + Sync> Worker<T> {
 
         // Acquire an advisory lock on either the concurrency key or the task ID.
         if !in_progress_task.try_acquire_lock(&mut tx).await? {
-            return Ok(None);
+            return Ok(TaskProcessingResult::NoTask);
         }
 
         let input: T::Input = serde_json::from_value(in_progress_task.input.clone())?;
@@ -832,7 +874,8 @@ impl<T: Task + Sync> Worker<T> {
             .expect("Task heartbeat should be compatible with std::time");
 
         // [CUSTOM RATE LIMITER INTERCEPTION]
-        // Check if the user attached a custom rate limiter algorithm (e.g. Token Bucket)
+        // Check if the user attached a custom rate limiter algorithm (e.g. Token
+        // Bucket)
         if let Some(limiter) = &self.queue.rate_limiter {
             match limiter.check(&self.queue.name).await {
                 Ok(crate::task::RateLimitDecision::Allowed) => {
@@ -863,7 +906,8 @@ impl<T: Task + Sync> Worker<T> {
                         task_id as crate::task::TaskId,
                         crate::task::State::Pending as crate::task::State,
                         self.queue.name.clone(),
-                        retry_interval as std::time::Duration // Type mapping accepted by sqlx for 'interval'
+                        retry_interval as std::time::Duration /* Type mapping accepted by sqlx
+                                                               * for 'interval' */
                     )
                     .execute(&mut *tx)
                     .await?;
@@ -884,7 +928,7 @@ impl<T: Task + Sync> Worker<T> {
                     tx.commit().await?;
 
                     // We successfully bypassed executing the task without "busy waiting".
-                    return Ok(Some(task_id));
+                    return Ok(TaskProcessingResult::RateLimited(task_id, retry_after));
                 }
                 Err(e) => {
                     // The custom rate limiter crashed evaluating this job! Treat as retryable.
@@ -898,7 +942,7 @@ impl<T: Task + Sync> Worker<T> {
                     )
                     .await?;
                     tx.commit().await?;
-                    return Ok(Some(task_id));
+                    return Ok(TaskProcessingResult::Processed(task_id));
                 }
             }
         }
@@ -954,7 +998,7 @@ impl<T: Task + Sync> Worker<T> {
 
         tx.commit().await?;
 
-        Ok(Some(task_id))
+        Ok(TaskProcessingResult::Processed(task_id))
     }
 
     async fn handle_task_error(
@@ -1076,7 +1120,7 @@ pub(crate) fn pg_interval_to_span(
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, time::Duration as StdDuration};
+    use std::{future::Future, pin::Pin, sync::Arc, time::Duration as StdDuration};
 
     use sqlx::{PgPool, Postgres, Transaction};
     use tokio::sync::Mutex;
@@ -1084,7 +1128,7 @@ mod tests {
     use super::*;
     use crate::{
         queue::graceful_shutdown,
-        task::{Result as TaskResult, State as TaskState},
+        task::{RateLimitDecision, RateLimiter, Result as TaskResult, State as TaskState},
     };
 
     struct TestTask;
@@ -1148,10 +1192,10 @@ mod tests {
         // Process the task.
         let queue = Arc::new(queue);
         let worker = Worker::new(queue.clone(), task);
-        let processed_task_id = worker
-            .process_next_task()
-            .await?
-            .expect("A task should be processed");
+        let processed_task_id = match worker.process_next_task().await? {
+            TaskProcessingResult::Processed(id) => id,
+            _ => panic!("A task should be processed"),
+        };
         assert_eq!(task_id, processed_task_id);
 
         // Check that the task was processed successfully.
@@ -1191,7 +1235,9 @@ mod tests {
         for _ in 0..3 {
             tokio::time::timeout(StdDuration::from_secs(5), async {
                 loop {
-                    if let Some(processed_task_id) = worker.process_next_task().await.unwrap() {
+                    if let TaskProcessingResult::Processed(processed_task_id) =
+                        worker.process_next_task().await.unwrap()
+                    {
                         assert_eq!(task_id, processed_task_id);
                         break;
                     }
@@ -1348,7 +1394,8 @@ mod tests {
         graceful_shutdown(&pool).await?;
 
         // Gracefully await the workers' `run().await` process completion safely.
-        // Once the workers exit natively, we are mathematically guaranteed the shutdown finished!
+        // Once the workers exit natively, we are mathematically guaranteed the shutdown
+        // finished!
         for handle in handles {
             let _ = tokio::time::timeout(StdDuration::from_secs(5), handle).await;
         }
@@ -1617,7 +1664,8 @@ mod tests {
         // Signal all to complete by dropping the transmitter!
         drop(tx);
 
-        // Wait securely for the threaded futures to complete using an intelligent polling loop up to 1 second
+        // Wait securely for the threaded futures to complete using an intelligent
+        // polling loop up to 1 second
         tokio::time::timeout(StdDuration::from_secs(1), async {
             loop {
                 reap_completed(&mut processing_tasks);
@@ -1631,5 +1679,128 @@ mod tests {
         .expect("JoinSet failed to drain and reap completed processes");
 
         assert!(processing_tasks.is_empty());
+    }
+
+    struct MockRateLimiter {
+        delay: StdDuration,
+        call_count: Arc<Mutex<u32>>,
+    }
+
+    impl RateLimiter for MockRateLimiter {
+        fn check<'a>(
+            &'a self,
+            _queue_name: &'a str,
+        ) -> Pin<Box<dyn Future<Output = crate::task::Result<RateLimitDecision>> + Send + 'a>>
+        {
+            Box::pin(async move {
+                let mut count = self.call_count.lock().await;
+                if *count == 0 {
+                    *count += 1;
+                    Ok(RateLimitDecision::Limited {
+                        retry_after: self.delay,
+                    })
+                } else {
+                    Ok(RateLimitDecision::Allowed)
+                }
+            })
+        }
+    }
+
+    #[sqlx::test]
+    async fn test_concurrency_refill(pool: PgPool) -> std::result::Result<(), Error> {
+        let queue = Queue::builder()
+            .name("concurrency_refill")
+            .pool(pool.clone())
+            .build()
+            .await?;
+
+        let task = TestTask;
+        let queue = Arc::new(queue);
+        let mut worker = Worker::new(queue.clone(), task);
+        worker.set_concurrency_limit(1);
+
+        // Enqueue 2 tasks
+        queue.enqueue(&pool, &TestTask, &()).await?;
+        queue.enqueue(&pool, &TestTask, &()).await?;
+
+        let handle = tokio::spawn({
+            let worker = worker.clone();
+            async move { worker.run_every(Span::new().hours(1)).await }
+        });
+
+        // Wait for both tasks to succeed without hitting the 1-hour poll.
+        tokio::time::timeout(StdDuration::from_secs(5), async {
+            loop {
+                let count: Option<i64> = sqlx::query_scalar!(
+                    r#"select count(*) from underway.task where state = 'succeeded' and task_queue_name = $1"#,
+                    "concurrency_refill"
+                )
+                .fetch_one(&pool)
+                .await?;
+                if count == Some(2) {
+                    break;
+                }
+                tokio::time::sleep(StdDuration::from_millis(100)).await;
+            }
+            Ok::<(), sqlx::Error>(())
+        })
+        .await
+        .expect("Tasks should both succeed via reactive refill")?;
+
+        worker.shutdown_token.cancel();
+        let _ = handle.await;
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn test_rate_limit_wakeup(pool: PgPool) -> std::result::Result<(), Error> {
+        let delay = StdDuration::from_millis(500);
+        let limiter = Arc::new(MockRateLimiter {
+            delay,
+            call_count: Arc::new(Mutex::new(0)),
+        });
+
+        let queue = Queue::<TestTask>::builder()
+            .name("rate_limit_wakeup")
+            .rate_limiter(limiter)
+            .pool(pool.clone())
+            .build()
+            .await?;
+
+        let task = TestTask;
+        let queue = Arc::new(queue);
+        let worker = Worker::new(queue.clone(), task);
+
+        queue.enqueue(&pool, &TestTask, &()).await?;
+
+        let handle = tokio::spawn({
+            let worker = worker.clone();
+            async move { worker.run_every(Span::new().hours(1)).await }
+        });
+
+        // The task should be rate limited first, then wake up and succeed.
+        tokio::time::timeout(StdDuration::from_secs(5), async {
+            loop {
+                let count: Option<i64> = sqlx::query_scalar!(
+                    r#"select count(*) from underway.task where state = 'succeeded' and task_queue_name = $1"#,
+                    "rate_limit_wakeup"
+                )
+                .fetch_one(&pool)
+                .await?;
+                if count == Some(1) {
+                    break;
+                }
+                tokio::time::sleep(StdDuration::from_millis(100)).await;
+            }
+            Ok::<(), sqlx::Error>(())
+        })
+        .await
+        .expect("Task should succeed after rate limit wakeup")?;
+
+        worker.shutdown_token.cancel();
+        let _ = handle.await;
+
+        Ok(())
     }
 }

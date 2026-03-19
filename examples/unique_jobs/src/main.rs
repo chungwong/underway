@@ -1,7 +1,8 @@
+use std::time::Duration;
+
 use jiff::ToSpan;
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Postgres, Transaction};
-use std::time::Duration;
 use underway::{task::UniqueJobStrategy, Queue, Task, Worker};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -178,7 +179,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n--- Replace Strategy ---");
     println!("Enqueueing first report generation for report-1");
 
-    // We'll enqueue it with a delay so it stays pending while we enqueue the second one
+    // We'll enqueue it with a delay so it stays pending while we enqueue the second
+    // one
     queue
         .enqueue_after(
             &pool,

@@ -1,13 +1,14 @@
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Postgres, Transaction};
-use std::time::Duration;
 use underway::{Queue, Task, Worker};
 
 // ==============================================================================
 //  1. HEAVY CPU WORK: Local Concurrency Example (max_concurrency)
 // ==============================================================================
-// Best for: Ensuring your local server/DB isn't crushed by 10,000 parallel jobs.
-// It simply limits how many workers can check out tasks.
+// Best for: Ensuring your local server/DB isn't crushed by 10,000 parallel
+// jobs. It simply limits how many workers can check out tasks.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct RunExpensiveJob {
     job_id: usize,
@@ -40,9 +41,10 @@ impl Task for HeavyWorkTask {
 // ==============================================================================
 //  2. EXTERNAL SAAS API: Global Rate Limiting Example (global_rate_limit)
 // ==============================================================================
-// Best for: Enforcing tight 3rd party API limits (e.g. 2 requests / 10 seconds).
-// Coordinates natively across EVERY running worker instantly, preventing 429s.
-// It delays execution gracefully into the future with zero "busy looping".
+// Best for: Enforcing tight 3rd party API limits (e.g. 2 requests / 10
+// seconds). Coordinates natively across EVERY running worker instantly,
+// preventing 429s. It delays execution gracefully into the future with zero
+// "busy looping".
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct ScrapeUrlJob {
     url: String,

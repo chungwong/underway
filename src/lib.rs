@@ -383,9 +383,11 @@
 //! ## Rate Limiting
 //!
 //! Rate limiting allows you to gracefully control the throughput of your queues
-//! using powerful distributed algorithms like Token Bucket, GCRA, and Fixed Window.
+//! using powerful distributed algorithms like Token Bucket, GCRA, and Fixed
+//! Window.
 //!
-//! See [`rate_limit`] for more details about global rate limiting API throttling.
+//! See [`rate_limit`] for more details about global rate limiting API
+//! throttling.
 #![warn(clippy::all, nonstandard_style, future_incompatible, missing_docs)]
 #![forbid(unsafe_code)]
 
@@ -404,7 +406,8 @@ pub use crate::{
 pub mod activity;
 mod activity_worker;
 pub mod queue;
-/// Provides native algorithms like Fixed Window and GCRA via PostgreSQL for `QueueBuilder::global_rate_limit`.
+/// Provides native algorithms like Fixed Window and GCRA via PostgreSQL for
+/// `QueueBuilder::global_rate_limit`.
 pub mod rate_limit;
 pub mod runtime;
 mod scheduler;
